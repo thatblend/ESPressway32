@@ -908,7 +908,7 @@ int player_laps = 0;
 unsigned long lap_start_ms = 0;
 unsigned long race_start_ms = 0;
 unsigned long race_finish_ms = 0;
-unsigned long best_lap_ms = 99999999;
+unsigned long best_time_ms = 99999999;
 unsigned long current_lap_ms = 0;
 
 int screen_shake_timer = 0;
@@ -1006,7 +1006,7 @@ void setup() {
     pinMode(14, INPUT_PULLUP);
     
     prefs.begin("esp-racer", false);
-    best_lap_ms = prefs.getULong("bestLap", 99999999UL);
+    best_time_ms = prefs.getULong("bestRace", 99999999UL);
     
     // Initialize Display
     tft.init();
@@ -1278,16 +1278,16 @@ void updatePhysics(float dt) {
             // Register Lap completed
             unsigned long now_ms = millis();
             current_lap_ms = now_ms - lap_start_ms;
-            if (current_lap_ms < best_lap_ms) {
-                best_lap_ms = current_lap_ms;
-                prefs.putULong("bestLap", best_lap_ms);
-            }
             lap_start_ms = now_ms;
             
             // Race Finish Line (3 Laps)
             if (player_laps >= 3) {
                 current_state = FINISHED;
                 race_finish_ms = (race_start_ms > 0) ? (now_ms - race_start_ms) : 0;
+                if (race_finish_ms > 0 && race_finish_ms < best_time_ms) {
+                    best_time_ms = race_finish_ms;
+                    prefs.putULong("bestRace", best_time_ms);
+                }
                 player_speed = 0.0f;
             }
         }
@@ -2353,10 +2353,10 @@ void drawHUD() {
     snprintf(lap_str, sizeof(lap_str), "LAP: %d / 3", display_lap);
     sprite.drawString(lap_str, 10, 8);
     
-    // Lap Time
+    // Race Time
     unsigned long elapsed = 0;
     if (current_state == PLAYING) {
-        elapsed = millis() - lap_start_ms;
+        elapsed = (race_start_ms > 0) ? (millis() - race_start_ms) : 0;
     } else if (current_state == FINISHED) {
         elapsed = race_finish_ms;
     }
@@ -2498,11 +2498,15 @@ void drawFinished() {
     snprintf(current_str, sizeof(current_str), "CURRENT: %02d:%02d.%02d", mins, secs, ms);
     sprite.drawString(current_str, 160, 78);
     
-    mins = best_lap_ms / 60000;
-    secs = (best_lap_ms % 60000) / 1000;
-    ms = (best_lap_ms % 1000) / 10;
     char best_str[32];
-    snprintf(best_str, sizeof(best_str), "BEST LAP: %02d:%02d.%02d", mins, secs, ms);
+    if (best_time_ms != 99999999) {
+        mins = best_time_ms / 60000;
+        secs = (best_time_ms % 60000) / 1000;
+        ms = (best_time_ms % 1000) / 10;
+        snprintf(best_str, sizeof(best_str), "BEST TIME: %02d:%02d.%02d", mins, secs, ms);
+    } else {
+        snprintf(best_str, sizeof(best_str), "BEST TIME: --:--.--");
+    }
     sprite.drawString(best_str, 160, 96);
     
     sprite.setTextColor(0x07FF);
@@ -2567,13 +2571,13 @@ void drawStartScreen() {
     sprite.drawString("ESPressway32", 160, 22);
     
     char menu_best_str[24];
-    if (best_lap_ms != 99999999) {
-        int b_mins = best_lap_ms / 60000;
-        int b_secs = (best_lap_ms % 60000) / 1000;
-        int b_ms = (best_lap_ms % 1000) / 10;
-        snprintf(menu_best_str, sizeof(menu_best_str), "BEST LAP: %02d:%02d.%02d", b_mins, b_secs, b_ms);
+    if (best_time_ms != 99999999) {
+        int b_mins = best_time_ms / 60000;
+        int b_secs = (best_time_ms % 60000) / 1000;
+        int b_ms = (best_time_ms % 1000) / 10;
+        snprintf(menu_best_str, sizeof(menu_best_str), "BEST TIME: %02d:%02d.%02d", b_mins, b_secs, b_ms);
     } else {
-        snprintf(menu_best_str, sizeof(menu_best_str), "BEST LAP: --:--.--");
+        snprintf(menu_best_str, sizeof(menu_best_str), "BEST TIME: --:--.--");
     }
     sprite.setTextSize(1);
     sprite.setTextColor(0x0000);
