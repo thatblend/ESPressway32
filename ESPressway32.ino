@@ -3,6 +3,11 @@
 #include <Preferences.h>
 #include <math.h>
 
+// User Config
+// Leave false for the normal T-Display-S3 orientation. Set true to rotate the screen 180 degrees.
+#define DISPLAY_FLIP_180 false
+#define DISPLAY_ROTATION (DISPLAY_FLIP_180 ? 1 : 3)
+
 // Game Constants
 #define SCREEN_WIDTH 320
 #define SCREEN_HEIGHT 170
@@ -1005,7 +1010,7 @@ void setup() {
     
     // Initialize Display
     tft.init();
-    tft.setRotation(3); // Landscape Mode
+    tft.setRotation(DISPLAY_ROTATION); // Landscape mode, optionally flipped 180 degrees.
     tft.setBrightness(255);
     
     // Initialize Double Buffer Sprite
