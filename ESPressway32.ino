@@ -7,6 +7,9 @@
 // Leave false for the normal T-Display-S3 orientation. Set true to rotate the screen 180 degrees.
 #define DISPLAY_FLIP_180 false
 #define DISPLAY_ROTATION (DISPLAY_FLIP_180 ? 1 : 3)
+// HUD performance readout (bottom-left corner).
+#define SHOW_FPS true           // show the frames-per-second counter
+#define SHOW_FRAME_TIMING false // also show CPU render time per frame in ms
 
 // Game Constants
 #define SCREEN_WIDTH 320
@@ -29,6 +32,21 @@
 #define SCENERY_DRAW_SEGMENTS 30
 #define MODEL_MAX_VERTICES 256
 #define MODEL_MAX_FACES 384
+#define NUM_OPPONENTS 4
+// Panel write clock. 20 MHz is the known-good speed for the T-Display-S3's
+// ST7789. Higher values (e.g. 24-32 MHz) may work on some units but can show
+// as shimmering static / missing screen regions -- raise only in small steps.
+#define LCD_BUS_WRITE_HZ 20000000
+// Async DMA frame push (double buffered). Set to 0 to fall back to blocking
+// pushSprite if the display ever misbehaves -- the game then runs slower but
+// uses the exact same proven transfer path as the original code.
+#define USE_DMA_PUSH 1
+#define FOG_COLOR 0xAE7C            // hazy horizon blue-grey (RGB565)
+#define FOG_START_SEGMENT 12        // road segments before distance fog kicks in
+#define GROUND_HALF_WIDTH 46.0f     // lateral reach of the terrain skirt per side
+#define GROUND_EDGE_DROP 1.1f       // outer terrain edge dips below the road for soft hillsides
+#define MAX_PARTICLES 28
+#define MINIMAP_POINTS 80
 
 // 3D Math Structures
 struct Point3D {
@@ -40,8 +58,9 @@ struct Point2D {
 };
 
 struct Face {
-    int indices[4];
-    int num_vertices;
+    uint8_t indices[4];
+    uint8_t num_vertices;
+    uint8_t flags;  // bit0: double-sided (exempt from backface culling)
     uint16_t color; // 0xFFFF means use base color
 };
 
@@ -63,7 +82,7 @@ class LGFX : public lgfx::LGFX_Device {
 public:
     LGFX() {
         auto bus_cfg = _bus.config();
-        bus_cfg.freq_write = 20000000;
+        bus_cfg.freq_write = LCD_BUS_WRITE_HZ;
         bus_cfg.pin_wr = 8;
         bus_cfg.pin_rd = 9;
         bus_cfg.pin_rs = 7;
@@ -95,7 +114,7 @@ public:
         panel_cfg.rgb_order = false;
         panel_cfg.invert = true;
         panel_cfg.dlen_16bit = false;
-        panel_cfg.bus_shared = true;
+        panel_cfg.bus_shared = false; // bus is exclusive to the panel; keeps DMA pushes async
         _panel.config(panel_cfg);
 
         auto light_cfg = _light.config();
@@ -111,7 +130,13 @@ public:
 };
 
 LGFX tft;
-LGFX_Sprite sprite(&tft);
+// Two full-screen framebuffers: while one streams to the panel over DMA, the
+// next frame renders into the other. All draw code keeps using the name
+// "sprite" through the alias below; loop() flips fb_idx after each push.
+LGFX_Sprite fb[2] = { LGFX_Sprite(&tft), LGFX_Sprite(&tft) };
+uint8_t fb_idx = 0;
+bool use_dma = false;
+#define sprite fb[fb_idx]
 Preferences prefs;
 
 float cam_x = 0.0f;
@@ -133,777 +158,59 @@ const float light_dir_x = 0.577f;
 const float light_dir_y = 0.707f;
 const float light_dir_z = -0.408f;
 
-// Camera space light direction (pre-rotated per frame)
-float cam_light_x = 0.577f;
-float cam_light_y = 0.707f;
-float cam_light_z = -0.408f;
+// Active light direction in WORLD space (the sun during the race, animated in
+// the menu). draw3DModel rotates it into model space once per call, so each
+// face is lit with a single dot product against its precomputed normal.
+float g_light_x = 0.577f;
+float g_light_y = 0.707f;
+float g_light_z = -0.408f;
 
 // Track array
 TrackSegment track[NUM_SEGMENTS];
 
-// 3D Low-Poly Models
-// Mesh converted from the downloaded Sketchfab Subaru Impreza 22B source OBJ.
-// Coordinates are normalized for the ESP32 flat-shaded renderer.
+// 3D model data: winding-corrected, outward-facing, with precomputed unit
+// face normals for one-dot-product lighting and exact backface culling.
+// The data tables themselves live at the BOTTOM of this file so the game
+// code stays together; regenerate them with tools/gen_models.py.
+// ===== GENERATED MODEL DECLARATIONS (tools/gen_models.py) -- do not hand-edit =====
 #define CAR_NUM_VERTICES 215
 #define CAR_NUM_FACES 368
-
-const Point3D car_vertices[CAR_NUM_VERTICES] = {
-    {  0.520f,  0.395f, -0.761f }, // 0
-    {  0.520f,  0.218f, -0.729f }, // 1
-    {  0.520f,  0.062f, -0.819f }, // 2
-    {  0.520f,  0.000f, -0.988f }, // 3
-    {  0.520f,  0.061f, -1.157f }, // 4
-    {  0.520f,  0.217f, -1.248f }, // 5
-    {  0.520f,  0.395f, -1.217f }, // 6
-    {  0.520f,  0.510f, -1.079f }, // 7
-    {  0.520f,  0.511f, -0.899f }, // 8
-    {  0.706f,  0.395f, -0.761f }, // 9
-    {  0.706f,  0.218f, -0.729f }, // 10
-    {  0.706f,  0.062f, -0.819f }, // 11
-    {  0.706f,  0.000f, -0.988f }, // 12
-    {  0.706f,  0.061f, -1.157f }, // 13
-    {  0.706f,  0.217f, -1.248f }, // 14
-    {  0.706f,  0.395f, -1.217f }, // 15
-    {  0.706f,  0.510f, -1.079f }, // 16
-    {  0.706f,  0.511f, -0.899f }, // 17
-    { -0.814f,  0.658f,  0.536f }, // 18
-    { -0.801f,  0.726f,  0.536f }, // 19
-    { -0.801f,  0.726f,  0.473f }, // 20
-    { -0.814f,  0.648f,  0.473f }, // 21
-    { -0.613f,  0.658f,  0.536f }, // 22
-    { -0.609f,  0.648f,  0.473f }, // 23
-    { -0.594f,  0.713f,  0.473f }, // 24
-    { -0.596f,  0.712f,  0.536f }, // 25
-    { -0.618f,  0.709f, -1.140f }, // 26
-    { -0.626f,  0.641f, -0.642f }, // 27
-    { -0.635f,  0.638f,  0.666f }, // 28
-    { -0.434f,  1.020f,  0.017f }, // 29
-    { -0.604f,  0.316f,  1.602f }, // 30
-    { -0.701f,  0.401f,  1.251f }, // 31
-    { -0.689f,  0.317f,  1.296f }, // 32
-    { -0.595f,  0.075f,  1.597f }, // 33
-    { -0.544f,  0.383f,  1.554f }, // 34
-    { -0.531f,  0.490f,  1.532f }, // 35
-    { -0.672f,  0.107f, -1.294f }, // 36
-    { -0.583f,  0.105f, -1.609f }, // 37
-    { -0.594f,  0.430f, -1.620f }, // 38
-    { -0.672f,  0.092f,  0.717f }, // 39
-    { -0.677f,  0.083f, -0.708f }, // 40
-    { -0.547f,  0.614f, -1.618f }, // 41
-    { -0.591f,  0.728f, -1.314f }, // 42
-    { -0.200f,  0.732f, -1.295f }, // 43
-    { -0.471f,  0.728f, -1.313f }, // 44
-    { -0.506f,  0.728f, -1.582f }, // 45
-    { -0.471f,  0.728f, -1.593f }, // 46
-    { -0.703f,  0.447f,  1.216f }, // 47
-    { -0.677f,  0.615f, -1.139f }, // 48
-    { -0.695f,  0.589f, -0.657f }, // 49
-    { -0.554f,  0.592f,  1.366f }, // 50
-    { -0.703f,  0.528f,  1.096f }, // 51
-    { -0.669f,  0.079f,  1.307f }, // 52
-    { -0.707f,  0.327f, -0.709f }, // 53
-    { -0.701f,  0.317f,  0.712f }, // 54
-    { -0.684f,  0.571f,  0.711f }, // 55
-    { -0.712f,  0.455f, -0.774f }, // 56
-    { -0.703f,  0.447f,  0.779f }, // 57
-    { -0.703f,  0.528f,  0.921f }, // 58
-    { -0.706f,  0.467f, -1.199f }, // 59
-    { -0.712f,  0.534f, -1.039f }, // 60
-    { -0.715f,  0.534f, -0.920f }, // 61
-    { -0.706f,  0.327f, -1.271f }, // 62
-    { -0.517f,  0.876f, -1.451f }, // 63
-    { -0.506f,  0.877f, -1.639f }, // 64
-    { -0.469f,  0.839f, -1.417f }, // 65
-    { -0.470f,  0.839f, -1.631f }, // 66
-    { -0.001f,  0.383f,  1.666f }, // 67
-    { -0.001f,  0.493f,  1.642f }, // 68
-    { -0.001f,  0.105f, -1.691f }, // 69
-    { -0.001f,  0.428f, -1.725f }, // 70
-    { -0.001f,  0.616f, -1.657f }, // 71
-    { -0.001f,  0.734f, -1.611f }, // 72
-    {  0.814f,  0.672f,  0.536f }, // 73
-    {  0.814f,  0.663f,  0.473f }, // 74
-    {  0.801f,  0.740f,  0.473f }, // 75
-    {  0.801f,  0.740f,  0.536f }, // 76
-    {  0.612f,  0.672f,  0.536f }, // 77
-    {  0.620f,  0.663f,  0.473f }, // 78
-    {  0.590f,  0.726f,  0.465f }, // 79
-    {  0.589f,  0.727f,  0.529f }, // 80
-    {  0.199f,  0.732f, -1.295f }, // 81
-    {  0.452f,  1.035f, -0.756f }, // 82
-    {  0.621f,  0.709f, -1.140f }, // 83
-    {  0.624f,  0.641f, -0.642f }, // 84
-    {  0.440f,  1.020f,  0.017f }, // 85
-    {  0.634f,  0.638f,  0.666f }, // 86
-    {  0.603f,  0.316f,  1.602f }, // 87
-    {  0.687f,  0.317f,  1.296f }, // 88
-    {  0.699f,  0.401f,  1.251f }, // 89
-    {  0.593f,  0.075f,  1.597f }, // 90
-    { -0.001f,  0.317f,  1.706f }, // 91
-    { -0.001f,  0.074f,  1.725f }, // 92
-    {  0.542f,  0.383f,  1.554f }, // 93
-    {  0.530f,  0.490f,  1.532f }, // 94
-    {  0.670f,  0.107f, -1.294f }, // 95
-    {  0.583f,  0.105f, -1.609f }, // 96
-    { -0.001f,  0.429f, -1.649f }, // 97
-    {  0.589f,  0.435f, -1.605f }, // 98
-    {  0.670f,  0.092f,  0.717f }, // 99
-    {  0.675f,  0.083f, -0.708f }, // 100
-    {  0.546f,  0.614f, -1.618f }, // 101
-    {  0.571f,  0.728f, -1.314f }, // 102
-    {  0.469f,  0.728f, -1.313f }, // 103
-    {  0.469f,  0.728f, -1.593f }, // 104
-    {  0.504f,  0.728f, -1.582f }, // 105
-    {  0.701f,  0.447f,  1.216f }, // 106
-    {  0.693f,  0.589f, -0.657f }, // 107
-    {  0.675f,  0.615f, -1.139f }, // 108
-    {  0.552f,  0.592f,  1.366f }, // 109
-    {  0.701f,  0.528f,  1.096f }, // 110
-    {  0.668f,  0.079f,  1.307f }, // 111
-    {  0.705f,  0.327f, -0.709f }, // 112
-    {  0.699f,  0.317f,  0.712f }, // 113
-    {  0.682f,  0.571f,  0.711f }, // 114
-    {  0.710f,  0.455f, -0.774f }, // 115
-    {  0.701f,  0.528f,  0.921f }, // 116
-    {  0.701f,  0.447f,  0.779f }, // 117
-    {  0.704f,  0.467f, -1.199f }, // 118
-    {  0.713f,  0.534f, -0.920f }, // 119
-    {  0.710f,  0.534f, -1.039f }, // 120
-    {  0.704f,  0.327f, -1.271f }, // 121
-    {  0.504f,  0.877f, -1.639f }, // 122
-    {  0.516f,  0.876f, -1.451f }, // 123
-    {  0.468f,  0.839f, -1.417f }, // 124
-    {  0.468f,  0.839f, -1.631f }, // 125
-    { -0.457f,  1.007f,  0.135f }, // 126
-    {  0.455f,  1.007f,  0.135f }, // 127
-    { -0.440f,  1.049f, -0.703f }, // 128
-    { -0.454f,  1.035f, -0.756f }, // 129
-    {  0.446f,  1.049f, -0.703f }, // 130
-    { -0.001f,  0.666f,  0.798f }, // 131
-    {  0.537f,  0.728f, -1.573f }, // 132
-    {  0.600f,  0.614f, -1.565f }, // 133
-    {  0.637f,  0.432f, -1.561f }, // 134
-    {  0.630f,  0.106f, -1.565f }, // 135
-    { -0.507f,  0.728f, -1.568f }, // 136
-    { -0.599f,  0.614f, -1.566f }, // 137
-    { -0.637f,  0.433f, -1.564f }, // 138
-    { -0.630f,  0.106f, -1.562f }, // 139
-    {  0.432f,  0.092f,  0.717f }, // 140
-    {  0.432f,  0.079f,  1.307f }, // 141
-    { -0.465f,  0.092f,  0.717f }, // 142
-    { -0.466f,  0.079f,  1.307f }, // 143
-    {  0.451f,  0.107f, -1.294f }, // 144
-    {  0.453f,  0.083f, -0.708f }, // 145
-    { -0.476f,  0.107f, -1.294f }, // 146
-    { -0.477f,  0.083f, -0.708f }, // 147
-    {  0.313f,  0.316f,  1.670f }, // 148
-    {  0.313f,  0.075f,  1.682f }, // 149
-    {  0.313f,  0.383f,  1.612f }, // 150
-    {  0.313f,  0.491f,  1.588f }, // 151
-    { -0.285f,  0.075f,  1.678f }, // 152
-    { -0.285f,  0.310f,  1.665f }, // 153
-    { -0.285f,  0.383f,  1.609f }, // 154
-    { -0.285f,  0.491f,  1.585f }, // 155
-    { -0.285f,  0.105f, -1.682f }, // 156
-    { -0.285f,  0.428f, -1.721f }, // 157
-    {  0.295f,  0.105f, -1.680f }, // 158
-    {  0.295f,  0.433f, -1.713f }, // 159
-    { -0.001f,  0.593f,  1.372f }, // 160
-    {  0.509f,  0.395f,  1.237f }, // 161
-    {  0.509f,  0.218f,  1.269f }, // 162
-    {  0.509f,  0.062f,  1.179f }, // 163
-    {  0.509f,  0.000f,  1.010f }, // 164
-    {  0.509f,  0.061f,  0.840f }, // 165
-    {  0.509f,  0.217f,  0.750f }, // 166
-    {  0.509f,  0.395f,  0.781f }, // 167
-    {  0.509f,  0.510f,  0.919f }, // 168
-    {  0.509f,  0.511f,  1.099f }, // 169
-    {  0.695f,  0.395f,  1.237f }, // 170
-    {  0.695f,  0.218f,  1.269f }, // 171
-    {  0.695f,  0.062f,  1.179f }, // 172
-    {  0.695f,  0.000f,  1.010f }, // 173
-    {  0.695f,  0.061f,  0.840f }, // 174
-    {  0.695f,  0.217f,  0.750f }, // 175
-    {  0.695f,  0.395f,  0.781f }, // 176
-    {  0.695f,  0.510f,  0.919f }, // 177
-    {  0.695f,  0.511f,  1.099f }, // 178
-    { -0.509f,  0.395f,  1.237f }, // 179
-    { -0.509f,  0.218f,  1.269f }, // 180
-    { -0.509f,  0.062f,  1.179f }, // 181
-    { -0.509f,  0.000f,  1.010f }, // 182
-    { -0.509f,  0.061f,  0.840f }, // 183
-    { -0.509f,  0.217f,  0.750f }, // 184
-    { -0.509f,  0.395f,  0.781f }, // 185
-    { -0.509f,  0.510f,  0.919f }, // 186
-    { -0.509f,  0.511f,  1.099f }, // 187
-    { -0.695f,  0.395f,  1.237f }, // 188
-    { -0.695f,  0.218f,  1.269f }, // 189
-    { -0.695f,  0.062f,  1.179f }, // 190
-    { -0.695f,  0.000f,  1.010f }, // 191
-    { -0.695f,  0.061f,  0.840f }, // 192
-    { -0.695f,  0.217f,  0.750f }, // 193
-    { -0.695f,  0.395f,  0.781f }, // 194
-    { -0.695f,  0.510f,  0.919f }, // 195
-    { -0.695f,  0.511f,  1.099f }, // 196
-    { -0.518f,  0.395f, -0.761f }, // 197
-    { -0.518f,  0.218f, -0.729f }, // 198
-    { -0.518f,  0.062f, -0.819f }, // 199
-    { -0.518f,  0.000f, -0.988f }, // 200
-    { -0.518f,  0.061f, -1.157f }, // 201
-    { -0.518f,  0.217f, -1.248f }, // 202
-    { -0.518f,  0.395f, -1.217f }, // 203
-    { -0.518f,  0.510f, -1.079f }, // 204
-    { -0.518f,  0.511f, -0.899f }, // 205
-    { -0.704f,  0.395f, -0.761f }, // 206
-    { -0.704f,  0.218f, -0.729f }, // 207
-    { -0.704f,  0.062f, -0.819f }, // 208
-    { -0.704f,  0.000f, -0.988f }, // 209
-    { -0.704f,  0.061f, -1.157f }, // 210
-    { -0.704f,  0.217f, -1.248f }, // 211
-    { -0.704f,  0.395f, -1.217f }, // 212
-    { -0.704f,  0.510f, -1.079f }, // 213
-    { -0.704f,  0.511f, -0.899f } // 214
-};
-
-const Face car_faces[CAR_NUM_FACES] = {
-    { {  3,  12,  11,   0}, 3, 0x0000 }, // 0: impreza_wheel
-    { { 11,   2,   3,   0}, 3, 0x0000 }, // 1: impreza_wheel
-    { {  5,  14,  13,   0}, 3, 0x0000 }, // 2: impreza_wheel
-    { { 13,   4,   5,   0}, 3, 0x0000 }, // 3: impreza_wheel
-    { {  7,  16,  15,   0}, 3, 0x0000 }, // 4: impreza_wheel
-    { { 15,   6,   7,   0}, 3, 0x0000 }, // 5: impreza_wheel
-    { {  8,  17,  16,   0}, 3, 0x0000 }, // 6: impreza_wheel
-    { { 16,   7,   8,   0}, 3, 0x0000 }, // 7: impreza_wheel
-    { {  0,   9,  17,   0}, 3, 0x0000 }, // 8: impreza_wheel
-    { { 17,   8,   0,   0}, 3, 0x0000 }, // 9: impreza_wheel
-    { {  2,   1,   0,   0}, 3, 0x0000 }, // 10: impreza_wheel
-    { {  0,   3,   2,   0}, 3, 0x0000 }, // 11: impreza_wheel
-    { {  3,   0,   8,   0}, 3, 0x0000 }, // 12: impreza_wheel
-    { {  8,   4,   3,   0}, 3, 0x0000 }, // 13: impreza_wheel
-    { {  4,   8,   7,   0}, 3, 0x0000 }, // 14: impreza_wheel
-    { {  7,   5,   4,   0}, 3, 0x0000 }, // 15: impreza_wheel
-    { {  6,   5,   7,   0}, 3, 0x0000 }, // 16: impreza_wheel
-    { {  9,   0,   1,   0}, 3, 0x0000 }, // 17: impreza_wheel
-    { {  1,  10,   9,   0}, 3, 0x0000 }, // 18: impreza_wheel
-    { { 10,   1,   2,   0}, 3, 0x0000 }, // 19: impreza_wheel
-    { {  2,  11,  10,   0}, 3, 0x0000 }, // 20: impreza_wheel
-    { { 12,   3,   4,   0}, 3, 0x0000 }, // 21: impreza_wheel
-    { {  4,  13,  12,   0}, 3, 0x0000 }, // 22: impreza_wheel
-    { { 14,   5,   6,   0}, 3, 0x0000 }, // 23: impreza_wheel
-    { {  6,  15,  14,   0}, 3, 0x0000 }, // 24: impreza_wheel
-    { { 11,  12,   9,   0}, 3, 0x0000 }, // 25: impreza_wheel
-    { {  9,  10,  11,   0}, 3, 0x0000 }, // 26: impreza_wheel
-    { { 12,  13,  17,   0}, 3, 0x0000 }, // 27: impreza_wheel
-    { { 17,   9,  12,   0}, 3, 0x0000 }, // 28: impreza_wheel
-    { { 13,  14,  16,   0}, 3, 0x0000 }, // 29: impreza_wheel
-    { { 16,  17,  13,   0}, 3, 0x0000 }, // 30: impreza_wheel
-    { { 15,  16,  14,   0}, 3, 0x0000 }, // 31: impreza_wheel
-    { { 18,  20,  21,   0}, 3, 0x0008 }, // 32: imprezachassis
-    { { 20,  18,  19,   0}, 3, 0x0008 }, // 33: imprezachassis
-    { { 22,  21,  23,   0}, 3, 0x0008 }, // 34: imprezachassis
-    { { 21,  22,  18,   0}, 3, 0x0008 }, // 35: imprezachassis
-    { { 23,  20,  24,   0}, 3, 0x0008 }, // 36: imprezachassis
-    { { 20,  23,  21,   0}, 3, 0x0008 }, // 37: imprezachassis
-    { { 24,  19,  25,   0}, 3, 0x0008 }, // 38: imprezachassis
-    { { 19,  24,  20,   0}, 3, 0x0008 }, // 39: imprezachassis
-    { { 25,  18,  22,   0}, 3, 0x0008 }, // 40: imprezachassis
-    { { 18,  25,  19,   0}, 3, 0x0008 }, // 41: imprezachassis
-    { { 43,  26, 129,   0}, 3, 0xFFFF }, // 42: imprezachassis
-    { { 27, 128, 129,   0}, 3, 0x0008 }, // 43: imprezachassis
-    { {128, 126,  29,   0}, 3, 0xFFFF }, // 44: imprezachassis
-    { { 27, 126, 128,   0}, 3, 0x0008 }, // 45: imprezachassis
-    { { 27,  28, 126,   0}, 3, 0x0008 }, // 46: imprezachassis
-    { { 30,  31,  32,   0}, 3, 0xFFFF }, // 47: imprezachassis
-    { { 33, 153,  30,   0}, 3, 0xFFFF }, // 48: imprezachassis
-    { {153,  33, 152,   0}, 3, 0xFFFF }, // 49: imprezachassis
-    { { 34, 153, 154,   0}, 3, 0xFFFF }, // 50: imprezachassis
-    { {153,  34,  30,   0}, 3, 0xFFFF }, // 51: imprezachassis
-    { { 35, 154, 155,   0}, 3, 0xFFFF }, // 52: imprezachassis
-    { {154,  35,  34,   0}, 3, 0xFFFF }, // 53: imprezachassis
-    { {135, 158,  96,   0}, 3, 0xFFFF }, // 54: imprezachassis
-    { {135,  69, 158,   0}, 3, 0xFFFF }, // 55: imprezachassis
-    { { 95,  69, 135,   0}, 3, 0xFFFF }, // 56: imprezachassis
-    { { 95, 156,  69,   0}, 3, 0xFFFF }, // 57: imprezachassis
-    { { 95,  37, 156,   0}, 3, 0xFFFF }, // 58: imprezachassis
-    { { 95, 139,  37,   0}, 3, 0xFFFF }, // 59: imprezachassis
-    { {144, 139,  95,   0}, 3, 0xFFFF }, // 60: imprezachassis
-    { {146, 139, 144,   0}, 3, 0xFFFF }, // 61: imprezachassis
-    { { 36, 139, 146,   0}, 3, 0xFFFF }, // 62: imprezachassis
-    { {157,  97,  70,   0}, 3, 0xFFFF }, // 63: imprezachassis
-    { { 97, 157,  38,   0}, 3, 0xFFFF }, // 64: imprezachassis
-    { { 37, 157, 156,   0}, 3, 0xFFFF }, // 65: imprezachassis
-    { {157,  37,  38,   0}, 3, 0xFFFF }, // 66: imprezachassis
-    { { 38,  71,  97,   0}, 3, 0xFFFF }, // 67: imprezachassis
-    { { 71,  38,  41,   0}, 3, 0xFFFF }, // 68: imprezachassis
-    { { 42,  43,  44,   0}, 3, 0xFFFF }, // 69: imprezachassis
-    { { 43,  42,  26,   0}, 3, 0xFFFF }, // 70: imprezachassis
-    { { 71,  46,  72,   0}, 3, 0xFFFF }, // 71: imprezachassis
-    { { 41,  46,  71,   0}, 3, 0xFFFF }, // 72: imprezachassis
-    { { 41,  45,  46,   0}, 3, 0xFFFF }, // 73: imprezachassis
-    { { 30,  47,  31,   0}, 3, 0xFFFF }, // 74: imprezachassis
-    { { 47,  30,  34,   0}, 3, 0xFFFF }, // 75: imprezachassis
-    { { 48,  27,  26,   0}, 3, 0xFFFF }, // 76: imprezachassis
-    { { 27,  48,  49,   0}, 3, 0x0008 }, // 77: imprezachassis
-    { { 50,  68, 160,   0}, 3, 0xFFFF }, // 78: imprezachassis
-    { { 50, 155,  68,   0}, 3, 0xFFFF }, // 79: imprezachassis
-    { { 50,  35, 155,   0}, 3, 0xFFFF }, // 80: imprezachassis
-    { { 35,  47,  34,   0}, 3, 0xFFFF }, // 81: imprezachassis
-    { { 47,  35,  51,   0}, 3, 0xFFFF }, // 82: imprezachassis
-    { { 50,  51,  35,   0}, 3, 0xFFFF }, // 83: imprezachassis
-    { { 51,  50,  28,   0}, 3, 0x0008 }, // 84: imprezachassis
-    { { 52,  30,  32,   0}, 3, 0xFFFF }, // 85: imprezachassis
-    { { 30,  52,  33,   0}, 3, 0xFFFF }, // 86: imprezachassis
-    { { 53,  39,  54,   0}, 3, 0xFFFF }, // 87: imprezachassis
-    { { 39,  53,  40,   0}, 3, 0xFFFF }, // 88: imprezachassis
-    { { 28,  49,  55,   0}, 3, 0x0008 }, // 89: imprezachassis
-    { { 49,  28,  27,   0}, 3, 0x0008 }, // 90: imprezachassis
-    { { 41, 136,  45,   0}, 3, 0xFFFF }, // 91: imprezachassis
-    { {136,  41, 137,   0}, 3, 0xFFFF }, // 92: imprezachassis
-    { {129,  26,  27,   0}, 3, 0x0008 }, // 93: imprezachassis
-    { { 56,  53,  49,   0}, 3, 0xFFFF }, // 94: imprezachassis
-    { { 53,  55,  49,   0}, 3, 0xFFFF }, // 95: imprezachassis
-    { { 55,  53,  54,   0}, 3, 0xFFFF }, // 96: imprezachassis
-    { { 57,  55,  54,   0}, 3, 0xFFFF }, // 97: imprezachassis
-    { { 55,  57,  58,   0}, 3, 0xFFFF }, // 98: imprezachassis
-    { { 28,  58,  51,   0}, 3, 0x0008 }, // 99: imprezachassis
-    { { 58,  28,  55,   0}, 3, 0x0008 }, // 100: imprezachassis
-    { { 49,  61,  56,   0}, 3, 0xFFFF }, // 101: imprezachassis
-    { { 61,  49,  60,   0}, 3, 0xFFFF }, // 102: imprezachassis
-    { { 38, 137,  41,   0}, 3, 0xFFFF }, // 103: imprezachassis
-    { {137,  38, 138,   0}, 3, 0xFFFF }, // 104: imprezachassis
-    { { 45,  63,  64,   0}, 3, 0xFFFF }, // 105: imprezachassis
-    { { 63, 136,  42,   0}, 3, 0xFFFF }, // 106: imprezachassis
-    { { 45, 136,  63,   0}, 3, 0xFFFF }, // 107: imprezachassis
-    { {102, 124, 103,   0}, 3, 0xFFFF }, // 108: imprezachassis
-    { {124, 102, 123,   0}, 3, 0xFFFF }, // 109: imprezachassis
-    { { 66,  45,  64,   0}, 3, 0xFFFF }, // 110: imprezachassis
-    { { 45,  66,  46,   0}, 3, 0xFFFF }, // 111: imprezachassis
-    { { 46,  65,  44,   0}, 3, 0xFFFF }, // 112: imprezachassis
-    { { 65,  46,  66,   0}, 3, 0xFFFF }, // 113: imprezachassis
-    { { 29, 130, 128,   0}, 3, 0xFFFF }, // 114: imprezachassis
-    { {130,  29,  85,   0}, 3, 0xFFFF }, // 115: imprezachassis
-    { { 50, 131,  28,   0}, 3, 0x0008 }, // 116: imprezachassis
-    { {131,  50, 160,   0}, 3, 0xFFFF }, // 117: imprezachassis
-    { { 64, 123, 122,   0}, 3, 0x0008 }, // 118: imprezachassis
-    { {123,  64,  63,   0}, 3, 0x0008 }, // 119: imprezachassis
-    { { 43,  46,  44,   0}, 3, 0xFFFF }, // 120: imprezachassis
-    { { 43,  72,  46,   0}, 3, 0x0008 }, // 121: imprezachassis
-    { {104,  81, 103,   0}, 3, 0xFFFF }, // 122: imprezachassis
-    { { 72,  81, 104,   0}, 3, 0x0008 }, // 123: imprezachassis
-    { { 43,  81,  72,   0}, 3, 0x0008 }, // 124: imprezachassis
-    { { 73,  75,  76,   0}, 3, 0x0008 }, // 125: imprezachassis
-    { { 75,  73,  74,   0}, 3, 0x0008 }, // 126: imprezachassis
-    { { 77,  74,  73,   0}, 3, 0x0008 }, // 127: imprezachassis
-    { { 74,  77,  78,   0}, 3, 0x0008 }, // 128: imprezachassis
-    { { 78,  75,  74,   0}, 3, 0x0008 }, // 129: imprezachassis
-    { { 75,  78,  79,   0}, 3, 0x0008 }, // 130: imprezachassis
-    { { 79,  76,  75,   0}, 3, 0x0008 }, // 131: imprezachassis
-    { { 76,  79,  80,   0}, 3, 0x0008 }, // 132: imprezachassis
-    { { 80,  73,  76,   0}, 3, 0x0008 }, // 133: imprezachassis
-    { { 73,  80,  77,   0}, 3, 0x0008 }, // 134: imprezachassis
-    { { 81,  82,  83,   0}, 3, 0xFFFF }, // 135: imprezachassis
-    { { 86,  85, 127,   0}, 3, 0x0008 }, // 136: imprezachassis
-    { { 84,  85,  86,   0}, 3, 0x0008 }, // 137: imprezachassis
-    { { 85,  82, 130,   0}, 3, 0xFFFF }, // 138: imprezachassis
-    { { 84,  82,  85,   0}, 3, 0x0008 }, // 139: imprezachassis
-    { { 87,  88,  89,   0}, 3, 0xFFFF }, // 140: imprezachassis
-    { { 90, 148, 149,   0}, 3, 0xFFFF }, // 141: imprezachassis
-    { {148,  90,  87,   0}, 3, 0xFFFF }, // 142: imprezachassis
-    { {148,  93, 150,   0}, 3, 0xFFFF }, // 143: imprezachassis
-    { { 93, 148,  87,   0}, 3, 0xFFFF }, // 144: imprezachassis
-    { {150,  94, 151,   0}, 3, 0xFFFF }, // 145: imprezachassis
-    { { 94, 150,  93,   0}, 3, 0xFFFF }, // 146: imprezachassis
-    { { 97, 159,  70,   0}, 3, 0xFFFF }, // 147: imprezachassis
-    { {159,  97,  98,   0}, 3, 0xFFFF }, // 148: imprezachassis
-    { { 99, 145, 100,   0}, 3, 0xFFFF }, // 149: imprezachassis
-    { { 99, 147, 145,   0}, 3, 0xFFFF }, // 150: imprezachassis
-    { { 99,  40, 147,   0}, 3, 0xFFFF }, // 151: imprezachassis
-    { { 40, 142,  39,   0}, 3, 0xFFFF }, // 152: imprezachassis
-    { { 40, 140, 142,   0}, 3, 0xFFFF }, // 153: imprezachassis
-    { { 99, 140,  40,   0}, 3, 0xFFFF }, // 154: imprezachassis
-    { { 96, 159,  98,   0}, 3, 0xFFFF }, // 155: imprezachassis
-    { {159,  96, 158,   0}, 3, 0xFFFF }, // 156: imprezachassis
-    { { 71,  98,  97,   0}, 3, 0xFFFF }, // 157: imprezachassis
-    { { 98,  71, 101,   0}, 3, 0xFFFF }, // 158: imprezachassis
-    { {102,  81,  83,   0}, 3, 0xFFFF }, // 159: imprezachassis
-    { { 81, 102, 103,   0}, 3, 0xFFFF }, // 160: imprezachassis
-    { {101, 104, 105,   0}, 3, 0xFFFF }, // 161: imprezachassis
-    { {104,  71,  72,   0}, 3, 0xFFFF }, // 162: imprezachassis
-    { {101,  71, 104,   0}, 3, 0xFFFF }, // 163: imprezachassis
-    { { 89,  93,  87,   0}, 3, 0xFFFF }, // 164: imprezachassis
-    { { 93,  89, 106,   0}, 3, 0xFFFF }, // 165: imprezachassis
-    { { 84, 108,  83,   0}, 3, 0xFFFF }, // 166: imprezachassis
-    { {108,  84, 107,   0}, 3, 0x0008 }, // 167: imprezachassis
-    { {109, 151,  94,   0}, 3, 0xFFFF }, // 168: imprezachassis
-    { {109,  68, 151,   0}, 3, 0xFFFF }, // 169: imprezachassis
-    { {109, 160,  68,   0}, 3, 0xFFFF }, // 170: imprezachassis
-    { {109, 110,  86,   0}, 3, 0x0008 }, // 171: imprezachassis
-    { {110, 109,  94,   0}, 3, 0xFFFF }, // 172: imprezachassis
-    { {111,  87,  90,   0}, 3, 0xFFFF }, // 173: imprezachassis
-    { { 87, 111,  88,   0}, 3, 0xFFFF }, // 174: imprezachassis
-    { {112,  99, 100,   0}, 3, 0xFFFF }, // 175: imprezachassis
-    { { 99, 112, 113,   0}, 3, 0xFFFF }, // 176: imprezachassis
-    { { 86, 107,  84,   0}, 3, 0x0008 }, // 177: imprezachassis
-    { {107,  86, 114,   0}, 3, 0x0008 }, // 178: imprezachassis
-    { {108, 102,  83,   0}, 3, 0xFFFF }, // 179: imprezachassis
-    { {102, 133, 132,   0}, 3, 0xFFFF }, // 180: imprezachassis
-    { {108, 133, 102,   0}, 3, 0xFFFF }, // 181: imprezachassis
-    { { 82,  84,  83,   0}, 3, 0x0008 }, // 182: imprezachassis
-    { {115, 107, 112,   0}, 3, 0xFFFF }, // 183: imprezachassis
-    { {112, 114, 113,   0}, 3, 0xFFFF }, // 184: imprezachassis
-    { {114, 112, 107,   0}, 3, 0xFFFF }, // 185: imprezachassis
-    { {117, 114, 116,   0}, 3, 0xFFFF }, // 186: imprezachassis
-    { {114, 117, 113,   0}, 3, 0xFFFF }, // 187: imprezachassis
-    { { 86, 116, 114,   0}, 3, 0x0008 }, // 188: imprezachassis
-    { {116,  86, 110,   0}, 3, 0x0008 }, // 189: imprezachassis
-    { {120, 108, 107,   0}, 3, 0xFFFF }, // 190: imprezachassis
-    { {108, 134, 133,   0}, 3, 0xFFFF }, // 191: imprezachassis
-    { {134, 108, 118,   0}, 3, 0xFFFF }, // 192: imprezachassis
-    { {135, 121,  95,   0}, 3, 0xFFFF }, // 193: imprezachassis
-    { {135, 118, 121,   0}, 3, 0xFFFF }, // 194: imprezachassis
-    { {135, 134, 118,   0}, 3, 0xFFFF }, // 195: imprezachassis
-    { {132, 123, 102,   0}, 3, 0xFFFF }, // 196: imprezachassis
-    { {105, 123, 132,   0}, 3, 0xFFFF }, // 197: imprezachassis
-    { {105, 122, 123,   0}, 3, 0xFFFF }, // 198: imprezachassis
-    { {104, 124, 125,   0}, 3, 0xFFFF }, // 199: imprezachassis
-    { {124, 104, 103,   0}, 3, 0xFFFF }, // 200: imprezachassis
-    { { 43,  82,  81,   0}, 3, 0x0008 }, // 201: imprezachassis
-    { { 82,  43, 129,   0}, 3, 0xFFFF }, // 202: imprezachassis
-    { { 52, 152,  33,   0}, 3, 0xFFFF }, // 203: imprezachassis
-    { { 52,  92, 152,   0}, 3, 0xFFFF }, // 204: imprezachassis
-    { { 52, 149,  92,   0}, 3, 0xFFFF }, // 205: imprezachassis
-    { { 52,  90, 149,   0}, 3, 0xFFFF }, // 206: imprezachassis
-    { { 90, 141, 111,   0}, 3, 0xFFFF }, // 207: imprezachassis
-    { { 90, 143, 141,   0}, 3, 0xFFFF }, // 208: imprezachassis
-    { { 52, 143,  90,   0}, 3, 0xFFFF }, // 209: imprezachassis
-    { {126, 131, 127,   0}, 3, 0x0008 }, // 210: imprezachassis
-    { { 66, 124,  65,   0}, 3, 0x0008 }, // 211: imprezachassis
-    { {124,  66, 125,   0}, 3, 0x0008 }, // 212: imprezachassis
-    { { 85, 126, 127,   0}, 3, 0xFFFF }, // 213: imprezachassis
-    { {126,  85,  29,   0}, 3, 0xFFFF }, // 214: imprezachassis
-    { { 82, 128, 130,   0}, 3, 0xFFFF }, // 215: imprezachassis
-    { {128,  82, 129,   0}, 3, 0xFFFF }, // 216: imprezachassis
-    { {127, 131,  86,   0}, 3, 0x0008 }, // 217: imprezachassis
-    { {131, 126,  28,   0}, 3, 0x0008 }, // 218: imprezachassis
-    { {138,  37, 139,   0}, 3, 0xFFFF }, // 219: imprezachassis
-    { { 37, 138,  38,   0}, 3, 0xFFFF }, // 220: imprezachassis
-    { { 94, 106, 110,   0}, 3, 0xFFFF }, // 221: imprezachassis
-    { {106,  94,  93,   0}, 3, 0xFFFF }, // 222: imprezachassis
-    { {119, 107, 115,   0}, 3, 0xFFFF }, // 223: imprezachassis
-    { {107, 119, 120,   0}, 3, 0xFFFF }, // 224: imprezachassis
-    { { 60,  48,  59,   0}, 3, 0xFFFF }, // 225: imprezachassis
-    { {125, 105, 104,   0}, 3, 0xFFFF }, // 226: imprezachassis
-    { {105, 125, 122,   0}, 3, 0xFFFF }, // 227: imprezachassis
-    { { 66, 122, 125,   0}, 3, 0x0008 }, // 228: imprezachassis
-    { {122,  66,  64,   0}, 3, 0x0008 }, // 229: imprezachassis
-    { { 42,  65,  63,   0}, 3, 0xFFFF }, // 230: imprezachassis
-    { { 65,  42,  44,   0}, 3, 0xFFFF }, // 231: imprezachassis
-    { { 63, 124, 123,   0}, 3, 0x0008 }, // 232: imprezachassis
-    { {124,  63,  65,   0}, 3, 0x0008 }, // 233: imprezachassis
-    { {132, 101, 105,   0}, 3, 0xFFFF }, // 234: imprezachassis
-    { {101, 132, 133,   0}, 3, 0xFFFF }, // 235: imprezachassis
-    { {133,  98, 101,   0}, 3, 0xFFFF }, // 236: imprezachassis
-    { { 98, 133, 134,   0}, 3, 0xFFFF }, // 237: imprezachassis
-    { {134,  96,  98,   0}, 3, 0xFFFF }, // 238: imprezachassis
-    { { 96, 134, 135,   0}, 3, 0xFFFF }, // 239: imprezachassis
-    { { 42,  48,  26,   0}, 3, 0xFFFF }, // 240: imprezachassis
-    { { 42, 137,  48,   0}, 3, 0xFFFF }, // 241: imprezachassis
-    { {136, 137,  42,   0}, 3, 0xFFFF }, // 242: imprezachassis
-    { { 48, 138,  59,   0}, 3, 0xFFFF }, // 243: imprezachassis
-    { {138,  48, 137,   0}, 3, 0xFFFF }, // 244: imprezachassis
-    { {138,  62,  59,   0}, 3, 0xFFFF }, // 245: imprezachassis
-    { {138,  36,  62,   0}, 3, 0xFFFF }, // 246: imprezachassis
-    { {138, 139,  36,   0}, 3, 0xFFFF }, // 247: imprezachassis
-    { {108, 120, 118,   0}, 3, 0xFFFF }, // 248: imprezachassis
-    { { 48,  60,  49,   0}, 3, 0xFFFF }, // 249: imprezachassis
-    { {142, 141, 143,   0}, 3, 0xFFFF }, // 250: imprezachassis
-    { {141, 142, 140,   0}, 3, 0xFFFF }, // 251: imprezachassis
-    { {144, 147, 146,   0}, 3, 0xFFFF }, // 252: imprezachassis
-    { {147, 144, 145,   0}, 3, 0xFFFF }, // 253: imprezachassis
-    { { 92, 148,  91,   0}, 3, 0xFFFF }, // 254: imprezachassis
-    { {148,  92, 149,   0}, 3, 0xFFFF }, // 255: imprezachassis
-    { {148,  67,  91,   0}, 3, 0xFFFF }, // 256: imprezachassis
-    { { 67, 148, 150,   0}, 3, 0xFFFF }, // 257: imprezachassis
-    { {150,  68,  67,   0}, 3, 0xFFFF }, // 258: imprezachassis
-    { { 68, 150, 151,   0}, 3, 0xFFFF }, // 259: imprezachassis
-    { { 91, 152,  92,   0}, 3, 0xFFFF }, // 260: imprezachassis
-    { {152,  91, 153,   0}, 3, 0xFFFF }, // 261: imprezachassis
-    { { 67, 153,  91,   0}, 3, 0xFFFF }, // 262: imprezachassis
-    { {153,  67, 154,   0}, 3, 0xFFFF }, // 263: imprezachassis
-    { { 68, 154,  67,   0}, 3, 0xFFFF }, // 264: imprezachassis
-    { {154,  68, 155,   0}, 3, 0xFFFF }, // 265: imprezachassis
-    { { 69, 157,  70,   0}, 3, 0xFFFF }, // 266: imprezachassis
-    { {157,  69, 156,   0}, 3, 0xFFFF }, // 267: imprezachassis
-    { {159,  69,  70,   0}, 3, 0xFFFF }, // 268: imprezachassis
-    { { 69, 159, 158,   0}, 3, 0xFFFF }, // 269: imprezachassis
-    { {131, 109,  86,   0}, 3, 0x0008 }, // 270: imprezachassis
-    { {109, 131, 160,   0}, 3, 0xFFFF }, // 271: imprezachassis
-    { {164, 173, 172,   0}, 3, 0x0000 }, // 272: impreza_wheel.002
-    { {172, 163, 164,   0}, 3, 0x0000 }, // 273: impreza_wheel.002
-    { {166, 175, 174,   0}, 3, 0x0000 }, // 274: impreza_wheel.002
-    { {174, 165, 166,   0}, 3, 0x0000 }, // 275: impreza_wheel.002
-    { {168, 177, 176,   0}, 3, 0x0000 }, // 276: impreza_wheel.002
-    { {176, 167, 168,   0}, 3, 0x0000 }, // 277: impreza_wheel.002
-    { {169, 178, 177,   0}, 3, 0x0000 }, // 278: impreza_wheel.002
-    { {177, 168, 169,   0}, 3, 0x0000 }, // 279: impreza_wheel.002
-    { {161, 170, 178,   0}, 3, 0x0000 }, // 280: impreza_wheel.002
-    { {178, 169, 161,   0}, 3, 0x0000 }, // 281: impreza_wheel.002
-    { {163, 162, 161,   0}, 3, 0x0000 }, // 282: impreza_wheel.002
-    { {161, 164, 163,   0}, 3, 0x0000 }, // 283: impreza_wheel.002
-    { {164, 161, 169,   0}, 3, 0x0000 }, // 284: impreza_wheel.002
-    { {169, 165, 164,   0}, 3, 0x0000 }, // 285: impreza_wheel.002
-    { {165, 169, 168,   0}, 3, 0x0000 }, // 286: impreza_wheel.002
-    { {168, 166, 165,   0}, 3, 0x0000 }, // 287: impreza_wheel.002
-    { {167, 166, 168,   0}, 3, 0x0000 }, // 288: impreza_wheel.002
-    { {170, 161, 162,   0}, 3, 0x0000 }, // 289: impreza_wheel.002
-    { {162, 171, 170,   0}, 3, 0x0000 }, // 290: impreza_wheel.002
-    { {171, 162, 163,   0}, 3, 0x0000 }, // 291: impreza_wheel.002
-    { {163, 172, 171,   0}, 3, 0x0000 }, // 292: impreza_wheel.002
-    { {173, 164, 165,   0}, 3, 0x0000 }, // 293: impreza_wheel.002
-    { {165, 174, 173,   0}, 3, 0x0000 }, // 294: impreza_wheel.002
-    { {175, 166, 167,   0}, 3, 0x0000 }, // 295: impreza_wheel.002
-    { {167, 176, 175,   0}, 3, 0x0000 }, // 296: impreza_wheel.002
-    { {172, 173, 170,   0}, 3, 0x0000 }, // 297: impreza_wheel.002
-    { {170, 171, 172,   0}, 3, 0x0000 }, // 298: impreza_wheel.002
-    { {173, 174, 178,   0}, 3, 0x0000 }, // 299: impreza_wheel.002
-    { {178, 170, 173,   0}, 3, 0x0000 }, // 300: impreza_wheel.002
-    { {174, 175, 177,   0}, 3, 0x0000 }, // 301: impreza_wheel.002
-    { {177, 178, 174,   0}, 3, 0x0000 }, // 302: impreza_wheel.002
-    { {176, 177, 175,   0}, 3, 0x0000 }, // 303: impreza_wheel.002
-    { {182, 190, 191,   0}, 3, 0x0000 }, // 304: impreza_wheel.001
-    { {190, 182, 181,   0}, 3, 0x0000 }, // 305: impreza_wheel.001
-    { {184, 192, 193,   0}, 3, 0x0000 }, // 306: impreza_wheel.001
-    { {192, 184, 183,   0}, 3, 0x0000 }, // 307: impreza_wheel.001
-    { {186, 194, 195,   0}, 3, 0x0000 }, // 308: impreza_wheel.001
-    { {194, 186, 185,   0}, 3, 0x0000 }, // 309: impreza_wheel.001
-    { {187, 195, 196,   0}, 3, 0x0000 }, // 310: impreza_wheel.001
-    { {195, 187, 186,   0}, 3, 0x0000 }, // 311: impreza_wheel.001
-    { {179, 196, 188,   0}, 3, 0x0000 }, // 312: impreza_wheel.001
-    { {196, 179, 187,   0}, 3, 0x0000 }, // 313: impreza_wheel.001
-    { {181, 179, 180,   0}, 3, 0x0000 }, // 314: impreza_wheel.001
-    { {179, 181, 182,   0}, 3, 0x0000 }, // 315: impreza_wheel.001
-    { {182, 187, 179,   0}, 3, 0x0000 }, // 316: impreza_wheel.001
-    { {187, 182, 183,   0}, 3, 0x0000 }, // 317: impreza_wheel.001
-    { {183, 186, 187,   0}, 3, 0x0000 }, // 318: impreza_wheel.001
-    { {186, 183, 184,   0}, 3, 0x0000 }, // 319: impreza_wheel.001
-    { {185, 186, 184,   0}, 3, 0x0000 }, // 320: impreza_wheel.001
-    { {188, 180, 179,   0}, 3, 0x0000 }, // 321: impreza_wheel.001
-    { {180, 188, 189,   0}, 3, 0x0000 }, // 322: impreza_wheel.001
-    { {189, 181, 180,   0}, 3, 0x0000 }, // 323: impreza_wheel.001
-    { {181, 189, 190,   0}, 3, 0x0000 }, // 324: impreza_wheel.001
-    { {191, 183, 182,   0}, 3, 0x0000 }, // 325: impreza_wheel.001
-    { {183, 191, 192,   0}, 3, 0x0000 }, // 326: impreza_wheel.001
-    { {193, 185, 184,   0}, 3, 0x0000 }, // 327: impreza_wheel.001
-    { {185, 193, 194,   0}, 3, 0x0000 }, // 328: impreza_wheel.001
-    { {190, 188, 191,   0}, 3, 0x0000 }, // 329: impreza_wheel.001
-    { {188, 190, 189,   0}, 3, 0x0000 }, // 330: impreza_wheel.001
-    { {191, 196, 192,   0}, 3, 0x0000 }, // 331: impreza_wheel.001
-    { {196, 191, 188,   0}, 3, 0x0000 }, // 332: impreza_wheel.001
-    { {192, 195, 193,   0}, 3, 0x0000 }, // 333: impreza_wheel.001
-    { {195, 192, 196,   0}, 3, 0x0000 }, // 334: impreza_wheel.001
-    { {194, 193, 195,   0}, 3, 0x0000 }, // 335: impreza_wheel.001
-    { {200, 208, 209,   0}, 3, 0x0000 }, // 336: impreza_wheel.003
-    { {208, 200, 199,   0}, 3, 0x0000 }, // 337: impreza_wheel.003
-    { {202, 210, 211,   0}, 3, 0x0000 }, // 338: impreza_wheel.003
-    { {210, 202, 201,   0}, 3, 0x0000 }, // 339: impreza_wheel.003
-    { {204, 212, 213,   0}, 3, 0x0000 }, // 340: impreza_wheel.003
-    { {212, 204, 203,   0}, 3, 0x0000 }, // 341: impreza_wheel.003
-    { {205, 213, 214,   0}, 3, 0x0000 }, // 342: impreza_wheel.003
-    { {213, 205, 204,   0}, 3, 0x0000 }, // 343: impreza_wheel.003
-    { {197, 214, 206,   0}, 3, 0x0000 }, // 344: impreza_wheel.003
-    { {214, 197, 205,   0}, 3, 0x0000 }, // 345: impreza_wheel.003
-    { {199, 197, 198,   0}, 3, 0x0000 }, // 346: impreza_wheel.003
-    { {197, 199, 200,   0}, 3, 0x0000 }, // 347: impreza_wheel.003
-    { {200, 205, 197,   0}, 3, 0x0000 }, // 348: impreza_wheel.003
-    { {205, 200, 201,   0}, 3, 0x0000 }, // 349: impreza_wheel.003
-    { {201, 204, 205,   0}, 3, 0x0000 }, // 350: impreza_wheel.003
-    { {204, 201, 202,   0}, 3, 0x0000 }, // 351: impreza_wheel.003
-    { {203, 204, 202,   0}, 3, 0x0000 }, // 352: impreza_wheel.003
-    { {206, 198, 197,   0}, 3, 0x0000 }, // 353: impreza_wheel.003
-    { {198, 206, 207,   0}, 3, 0x0000 }, // 354: impreza_wheel.003
-    { {207, 199, 198,   0}, 3, 0x0000 }, // 355: impreza_wheel.003
-    { {199, 207, 208,   0}, 3, 0x0000 }, // 356: impreza_wheel.003
-    { {209, 201, 200,   0}, 3, 0x0000 }, // 357: impreza_wheel.003
-    { {201, 209, 210,   0}, 3, 0x0000 }, // 358: impreza_wheel.003
-    { {211, 203, 202,   0}, 3, 0x0000 }, // 359: impreza_wheel.003
-    { {203, 211, 212,   0}, 3, 0x0000 }, // 360: impreza_wheel.003
-    { {208, 206, 209,   0}, 3, 0x0000 }, // 361: impreza_wheel.003
-    { {206, 208, 207,   0}, 3, 0x0000 }, // 362: impreza_wheel.003
-    { {209, 214, 210,   0}, 3, 0x0000 }, // 363: impreza_wheel.003
-    { {214, 209, 206,   0}, 3, 0x0000 }, // 364: impreza_wheel.003
-    { {210, 213, 211,   0}, 3, 0x0000 }, // 365: impreza_wheel.003
-    { {213, 210, 214,   0}, 3, 0x0000 }, // 366: impreza_wheel.003
-    { {212, 211, 213,   0}, 3, 0x0000 } // 367: impreza_wheel.003
-};
-
+extern const Point3D car_vertices[CAR_NUM_VERTICES];
+extern const Face car_faces[CAR_NUM_FACES];
+extern const Point3D car_normals[CAR_NUM_FACES];
 #define LOD_CAR_NUM_VERTICES 32
 #define LOD_CAR_NUM_FACES 23
-
-const Point3D lod_car_vertices[LOD_CAR_NUM_VERTICES] = {
-    { -0.6f,  0.1f,  1.4f }, { -0.5f,  0.4f,  1.2f }, { -0.5f,  0.45f,  0.5f }, { -0.4f,  0.8f,   0.1f },
-    { -0.4f,  0.75f, -0.6f }, { -0.5f,  0.5f, -1.2f }, { -0.6f,  0.2f,  -1.3f }, { -0.6f,  0.1f,  -1.3f },
-    {  0.6f,  0.1f,  1.4f }, {  0.5f,  0.4f,  1.2f }, {  0.5f,  0.45f,  0.5f }, {  0.4f,  0.8f,   0.1f },
-    {  0.4f,  0.75f, -0.6f }, {  0.5f,  0.5f, -1.2f }, {  0.6f,  0.2f,  -1.3f }, {  0.6f,  0.1f,  -1.3f },
-    { -0.65f, -0.05f,  1.1f }, { -0.65f,  0.25f,  1.1f }, { -0.65f,  0.25f,  0.5f }, { -0.65f, -0.05f,  0.5f },
-    { -0.65f, -0.05f, -0.6f }, { -0.65f,  0.25f, -0.6f }, { -0.65f,  0.25f, -1.2f }, { -0.65f, -0.05f, -1.2f },
-    {  0.65f, -0.05f,  1.1f }, {  0.65f,  0.25f,  1.1f }, {  0.65f,  0.25f,  0.5f }, {  0.65f, -0.05f,  0.5f },
-    {  0.65f, -0.05f, -0.6f }, {  0.65f,  0.25f, -0.6f }, {  0.65f,  0.25f, -1.2f }, {  0.65f, -0.05f, -1.2f }
-};
-
-const Face lod_car_faces[LOD_CAR_NUM_FACES] = {
-    { {0, 8, 9, 1}, 4, 0x3186 }, { {1, 9, 10, 2}, 4, 0xFFFF }, { {2, 10, 11, 3}, 4, 0x0008 },
-    { {3, 11, 12, 4}, 4, 0xFFFF }, { {4, 12, 13, 5}, 4, 0x0008 }, { {5, 13, 14, 6}, 4, 0xFFFF },
-    { {6, 14, 15, 7}, 4, 0x3186 }, { {0, 1, 2, 0}, 3, 0xFFFF }, { {2, 3, 4, 0}, 3, 0xFFFF },
-    { {4, 5, 6, 0}, 3, 0xFFFF }, { {0, 2, 4, 0}, 3, 0xFFFF }, { {0, 4, 6, 0}, 3, 0xFFFF },
-    { {0, 6, 7, 0}, 3, 0x18C3 }, { {8, 10, 9, 0}, 3, 0xFFFF }, { {10, 12, 11, 0}, 3, 0xFFFF },
-    { {12, 14, 13, 0}, 3, 0xFFFF }, { {8, 12, 10, 0}, 3, 0xFFFF }, { {8, 14, 12, 0}, 3, 0xFFFF },
-    { {8, 15, 14, 0}, 3, 0x18C3 }, { {16, 17, 18, 19}, 4, 0x0000 }, { {20, 21, 22, 23}, 4, 0x0000 },
-    { {24, 25, 26, 27}, 4, 0x0000 }, { {28, 29, 30, 31}, 4, 0x0000 }
-};
-
+extern const Point3D lod_car_vertices[LOD_CAR_NUM_VERTICES];
+extern const Face lod_car_faces[LOD_CAR_NUM_FACES];
+extern const Point3D lod_car_normals[LOD_CAR_NUM_FACES];
 #define TREE_NUM_VERTICES 13
 #define TREE_NUM_FACES 9
-
-const Point3D tree_vertices[TREE_NUM_VERTICES] = {
-    // Trunk (0 to 7)
-    { -0.12f, 0.0f, -0.12f }, // 0
-    {  0.12f, 0.0f, -0.12f }, // 1
-    {  0.12f, 0.0f,  0.12f }, // 2
-    { -0.12f, 0.0f,  0.12f }, // 3
-    { -0.12f, 0.8f, -0.12f }, // 4
-    {  0.12f, 0.8f, -0.12f }, // 5
-    {  0.12f, 0.8f,  0.12f }, // 6
-    { -0.12f, 0.8f,  0.12f }, // 7
-    
-    // Foliage (8 to 12)
-    { -0.7f, 0.8f, -0.7f }, // 8
-    {  0.7f, 0.8f, -0.7f }, // 9
-    {  0.7f, 0.8f,  0.7f }, // 10
-    { -0.7f, 0.8f,  0.7f }, // 11
-    {  0.0f, 2.8f,  0.0f }  // 12: Peak
-};
-
-const Face tree_faces[TREE_NUM_FACES] = {
-    // Trunk sides
-    { {0, 1, 5, 4}, 4, 0x51E0 }, // Bark Brown
-    { {1, 2, 6, 5}, 4, 0x51E0 },
-    { {2, 3, 7, 6}, 4, 0x51E0 },
-    { {3, 0, 4, 7}, 4, 0x51E0 },
-    
-    // Foliage base
-    { {8, 11, 10, 9}, 4, 0x04A0 }, // Dark green
-    
-    // Foliage sides
-    { {8, 9, 12}, 3, 0x0640 },   // Mid green
-    { {9, 10, 12}, 3, 0x0640 },
-    { {10, 11, 12}, 3, 0x0640 },
-    { {11, 8, 12}, 3, 0x0640 }
-};
-
+extern const Point3D tree_vertices[TREE_NUM_VERTICES];
+extern const Face tree_faces[TREE_NUM_FACES];
+extern const Point3D tree_normals[TREE_NUM_FACES];
 #define BILLBOARD_NUM_VERTICES 8
 #define BILLBOARD_NUM_FACES 1
-
-const Point3D billboard_vertices[BILLBOARD_NUM_VERTICES] = {
-    // Left Post (0 to 1)
-    { -1.5f, 0.0f, 0.0f },
-    { -1.5f, 1.4f, 0.0f },
-    // Right Post (2 to 3)
-    {  1.5f, 0.0f, 0.0f },
-    {  1.5f, 1.4f, 0.0f },
-    // Board (4 to 7)
-    { -1.8f, 1.3f, 0.0f }, // 4: Bottom-Left
-    {  1.8f, 1.3f, 0.0f }, // 5: Bottom-Right
-    {  1.8f, 2.4f, 0.0f }, // 6: Top-Right
-    { -1.8f, 2.4f, 0.0f }  // 7: Top-Left
-};
-
-const Face billboard_faces[BILLBOARD_NUM_FACES] = {
-    { {4, 5, 6, 7}, 4, 0xFFFF } // Board Face (uses base color)
-};
-
+extern const Point3D billboard_vertices[BILLBOARD_NUM_VERTICES];
+extern const Face billboard_faces[BILLBOARD_NUM_FACES];
+extern const Point3D billboard_normals[BILLBOARD_NUM_FACES];
 #define BRIDGE_NUM_VERTICES 24
 #define BRIDGE_NUM_FACES 12
-
-const Point3D bridge_vertices[BRIDGE_NUM_VERTICES] = {
-    // Left Pillar (0 to 7)
-    { -3.4f, 0.0f, -0.4f }, // 0
-    { -2.9f, 0.0f, -0.4f }, // 1
-    { -2.9f, 3.5f, -0.4f }, // 2
-    { -3.4f, 3.5f, -0.4f }, // 3
-    { -3.4f, 0.0f,  0.4f }, // 4
-    { -2.9f, 0.0f,  0.4f }, // 5
-    { -2.9f, 3.5f,  0.4f }, // 6
-    { -3.4f, 3.5f,  0.4f }, // 7
-    
-    // Right Pillar (8 to 15)
-    {  2.9f, 0.0f, -0.4f }, // 8
-    {  3.4f, 0.0f, -0.4f }, // 9
-    {  3.4f, 3.5f, -0.4f }, // 10
-    {  2.9f, 3.5f, -0.4f }, // 11
-    {  2.9f, 0.0f,  0.4f }, // 12
-    {  3.4f, 0.0f,  0.4f }, // 13
-    {  3.4f, 3.5f,  0.4f }, // 14
-    {  2.9f, 3.5f,  0.4f }, // 15
-    
-    // Cross Beam (16 to 23)
-    { -3.4f, 3.5f, -0.4f }, // 16 (same as 3)
-    {  3.4f, 3.5f, -0.4f }, // 17 (same as 10)
-    {  3.4f, 4.3f, -0.4f }, // 18
-    { -3.4f, 4.3f, -0.4f }, // 19
-    { -3.4f, 3.5f,  0.4f }, // 20 (same as 7)
-    {  3.4f, 3.5f,  0.4f }, // 21 (same as 14)
-    {  3.4f, 4.3f,  0.4f }, // 22
-    { -3.4f, 4.3f,  0.4f }  // 23
-};
-
-const Face bridge_faces[BRIDGE_NUM_FACES] = {
-    // Left Pillar sides
-    { {0, 1, 2, 3}, 4, 0x5AEB }, // Light grey
-    { {4, 7, 6, 5}, 4, 0x5AEB },
-    { {0, 4, 7, 3}, 4, 0x3186 }, // Dark grey
-    { {1, 5, 6, 2}, 4, 0x3186 },
-    
-    // Right Pillar sides
-    { {8, 9, 10, 11}, 4, 0x5AEB },
-    { {12, 15, 14, 13}, 4, 0x5AEB },
-    { {8, 12, 15, 11}, 4, 0x3186 },
-    { {9, 13, 14, 10}, 4, 0x3186 },
-    
-    // Cross Beam sides
-    { {16, 17, 18, 19}, 4, 0xF800 }, // Red front
-    { {20, 23, 22, 21}, 4, 0xF800 }, // Red back
-    { {19, 18, 22, 23}, 4, 0xFBE0 }, // Orange top
-    { {16, 20, 21, 17}, 4, 0x5AEB }  // Grey bottom
-};
-
-const Face gantry_faces[BRIDGE_NUM_FACES] = {
-    // Left Pillar sides
-    { {0, 1, 2, 3}, 4, 0xFFFF },
-    { {4, 7, 6, 5}, 4, 0xFFFF },
-    { {0, 4, 7, 3}, 4, 0x3186 },
-    { {1, 5, 6, 2}, 4, 0x3186 },
-    
-    // Right Pillar sides
-    { {8, 9, 10, 11}, 4, 0xFFFF },
-    { {12, 15, 14, 13}, 4, 0xFFFF },
-    { {8, 12, 15, 11}, 4, 0x3186 },
-    { {9, 13, 14, 10}, 4, 0x3186 },
-    
-    // Finish beam
-    { {16, 17, 18, 19}, 4, 0xFFFF },
-    { {20, 23, 22, 21}, 4, 0xFFFF },
-    { {19, 18, 22, 23}, 4, 0x0000 },
-    { {16, 20, 21, 17}, 4, 0x5AEB }
-};
+extern const Point3D bridge_vertices[BRIDGE_NUM_VERTICES];
+extern const Face bridge_faces[BRIDGE_NUM_FACES];
+extern const Face gantry_faces[BRIDGE_NUM_FACES];
+extern const Point3D bridge_normals[BRIDGE_NUM_FACES];
+// ===== END GENERATED MODEL DECLARATIONS =====
 
 // Player State Variables
 float player_segment_float = 0.0f;
 float player_w = 0.0f;          // Lateral offset (-2.5 to 2.5 on road)
 float player_speed = 0.0f;      // km/h
 float player_roll = 0.0f;       // Visual tilt when turning
+float player_pitch = 0.0f;      // Visual nose up/down following the road grade
 float player_steer_angle = 0.0f;// Front wheel steer angle
 float wheel_spin_angle = 0.0f;  // Spin value
 int player_laps = 0;
+bool player_braking = false;    // both buttons held -> show brake lights
 
 unsigned long lap_start_ms = 0;
 unsigned long race_start_ms = 0;
@@ -928,14 +235,33 @@ struct Opponent {
     float speed;
     uint16_t color;
     float target_lateral;
-    int lane_change_timer;
+    float lane_change_timer; // seconds until the next lane change
     int laps;
 };
 
-Opponent opponents[2] = {
+Opponent opponents[NUM_OPPONENTS] = {
     { 2.0f, -0.9f, 0.0f, 0xFFE0, -0.9f, 0, 0 }, // Yellow
-    { 3.0f,  0.9f, 0.0f, 0x07FF,  0.9f, 0, 0 }  // Cyan
+    { 3.0f,  0.9f, 0.0f, 0x07FF,  0.9f, 0, 0 }, // Cyan
+    { 4.0f, -0.9f, 0.0f, 0xFD20, -0.9f, 0, 0 }, // Orange
+    { 5.0f,  0.9f, 0.0f, 0xF81F,  0.9f, 0, 0 }  // Magenta
 };
+const float opponent_base_speed[NUM_OPPONENTS] = { 175.0f, 168.0f, 171.0f, 164.0f };
+
+// Screen-space particles: dirt spray off-road, sparks on collisions.
+struct Particle {
+    float x, y, vx, vy;
+    int16_t life;
+    uint16_t color;
+};
+Particle particles[MAX_PARTICLES];
+int particle_cursor = 0;
+
+// True top-down minimap outline, precomputed from the track at startup.
+int16_t mm_px[MINIMAP_POINTS];
+int16_t mm_py[MINIMAP_POINTS];
+
+// Per-draw-distance fog blend factor (0..32 toward FOG_COLOR).
+uint8_t fog_table[ROAD_DRAW_SEGMENTS + 2];
 
 enum GameState {
     START_SCREEN,
@@ -967,27 +293,70 @@ void drawBackground(int horizon_y, float yaw);
 void drawClouds(int horizon_y, float yaw);
 void drawMountains(int horizon_y, float yaw);
 void drawQuad(float sx0, float sy0, float sx1, float sy1, float sx2, float sy2, float sx3, float sy3, uint16_t color);
-void draw3DModel(const Point3D* vertices, int num_vertices, const Face* faces, int num_faces, 
-                 float pos_x, float pos_y, float pos_z, 
-                 float rot_x, float rot_y, float rot_z, 
-                 float scale, uint16_t base_color);
+void draw3DModel(const Point3D* vertices, int num_vertices,
+                 const Face* faces, const Point3D* normals, int num_faces,
+                 float pos_x, float pos_y, float pos_z,
+                 float rot_x, float rot_y, float rot_z,
+                 float scale, uint16_t base_color, uint8_t fog_a);
 void drawCarRearGlass(float pos_x, float pos_y, float pos_z,
                       float rot_x, float rot_y, float rot_z,
-                      float scale);
-void drawBillboard(float pos_x, float pos_y, float pos_z, float rot_y, float scale, uint16_t color);
-void drawTreeImpostor(float pos_x, float pos_y, float pos_z, float scale);
+                      float scale, bool braking);
+void drawBillboard(float pos_x, float pos_y, float pos_z, float rot_y, float scale, uint16_t color, uint8_t fog_a);
+void drawTreeImpostor(float pos_x, float pos_y, float pos_z, float scale, uint8_t fog_a);
 void drawOpponentBrakeLights(float pos_x, float pos_y, float pos_z, float yaw, bool braking);
-void drawStartFinishGantry(int seg);
-void drawTracksideLake(int seg);
-void drawSegmentScenery(int seg);
-void drawSegmentOpponents(int seg);
+void drawStartFinishGantry(int seg, uint8_t fog_a);
+void drawTracksideLake(int seg, uint8_t fog_a);
+void drawSegmentScenery(int seg, uint8_t fog_a);
+void drawSegmentOpponents(int seg, uint8_t fog_a);
 bool projectPoint(float wx, float wy, float wz, float& sx, float& sy, float& sz);
 void getTrackPosition(float seg_float, float lateral_pos, float& out_x, float& out_y, float& out_z, float& out_rx, float& out_rz);
 void cameraRelativeToWorld(float local_x, float local_y, float local_z, float& out_x, float& out_y, float& out_z);
 void updateCameraTrig();
 float stableJitter(int seg, int side, int index, int salt);
 float approachFloat(float current, float target, float response, float dt);
-uint16_t shadeColor(uint16_t color, float intensity);
+void buildMinimap();
+void buildFogTable();
+void spawnParticle(float x, float y, float vx, float vy, int life, uint16_t color);
+void spawnImpactSparks(int cx, int cy, float dir);
+void updateAndDrawParticles();
+void shadowEllipse(int cx, int cy, int rx, int ry, uint8_t darken);
+void fillGradientRows(int y_start, int y_end, int span_start, int span_len,
+                      int r0, int g0, int b0, int r1, int g1, int b1);
+
+// Integer RGB565 shading: i32 is 0..32 (32 = full brightness).
+static inline uint16_t shade565(uint16_t c, uint8_t i32) {
+    uint32_t rb = ((uint32_t)(c & 0xF81F) * i32) >> 5;
+    uint32_t g  = ((uint32_t)(c & 0x07E0) * i32) >> 5;
+    return (uint16_t)((rb & 0xF81F) | (g & 0x07E0));
+}
+
+// Integer RGB565 blend: alpha32 is 0..32 toward color b.
+static inline uint16_t blend565(uint16_t a, uint16_t b, uint8_t alpha32) {
+    uint32_t ia = 32 - alpha32;
+    uint32_t rb = ((uint32_t)(a & 0xF81F) * ia + (uint32_t)(b & 0xF81F) * alpha32) >> 5;
+    uint32_t g  = ((uint32_t)(a & 0x07E0) * ia + (uint32_t)(b & 0x07E0) * alpha32) >> 5;
+    return (uint16_t)((rb & 0xF81F) | (g & 0x07E0));
+}
+
+static inline uint16_t pack565(int r, int g, int b) {
+    return (uint16_t)(((r >> 3) << 11) | ((g >> 2) << 5) | (b >> 3));
+}
+
+// Direction-preserving pull-in of a projected point toward the screen
+// center. Used to shrink stretched off-screen geometry whose edges are
+// visually tolerant (e.g. grass-on-grass), so the rasterizer walks less.
+static inline void pullInRadial(float& sx, float& sy, float limit) {
+    float ox = sx - center_x;
+    float oy = sy - center_y;
+    float ax = fabsf(ox);
+    float ay = fabsf(oy);
+    float m = (ax > ay) ? ax : ay;
+    if (m > limit) {
+        float k = limit / m;
+        sx = center_x + ox * k;
+        sy = center_y + oy * k;
+    }
+}
 
 // Setup Function
 void setup() {
@@ -1013,13 +382,21 @@ void setup() {
     tft.setRotation(DISPLAY_ROTATION); // Landscape mode, optionally flipped 180 degrees.
     tft.setBrightness(255);
     
-    // Initialize Double Buffer Sprite
-    sprite.setColorDepth(16);
-    sprite.createSprite(SCREEN_WIDTH, SCREEN_HEIGHT);
-    sprite.setSwapBytes(true);
-    
+    // Two framebuffers in internal (DMA-capable) RAM. If the second
+    // allocation fails we fall back to single-buffer blocking pushes.
+    fb[0].setColorDepth(16);
+    fb[1].setColorDepth(16);
+    bool fb0_ok = (fb[0].createSprite(SCREEN_WIDTH, SCREEN_HEIGHT) != nullptr);
+    use_dma = USE_DMA_PUSH && fb0_ok && (fb[1].createSprite(SCREEN_WIDTH, SCREEN_HEIGHT) != nullptr);
+    if (use_dma) {
+        tft.initDMA();
+        tft.startWrite(); // hold the bus transaction so DMA pushes stay asynchronous
+    }
+
     // Procedurally Generate Track
     generateTrack();
+    buildMinimap();
+    buildFogTable();
     resetRaceState();
     
     // Timers
@@ -1075,9 +452,18 @@ void loop() {
         }
     }
     
-    // Push the frame buffer to the physical screen
+    // Push the frame buffer to the physical screen. With DMA the call only
+    // kicks off the transfer; the next frame renders into the other buffer
+    // while this one streams out, so the push costs ~0 CPU time.
     unsigned long before_push_us = micros();
-    sprite.pushSprite(0, 0);
+    if (use_dma) {
+        tft.waitDMA(); // previous frame must be fully out before reusing the channel
+        tft.pushImageDMA(0, 0, SCREEN_WIDTH, SCREEN_HEIGHT,
+                         (const lgfx::swap565_t*)sprite.getBuffer());
+        fb_idx ^= 1;
+    } else {
+        sprite.pushSprite(0, 0);
+    }
     unsigned long after_push_us = micros();
     
     perf_frame_ms = elapsed_us * 0.001f;
@@ -1107,17 +493,19 @@ void generateTrack() {
         float pitch;
     };
     
+    // Pitch values create rolling hills; they are chosen so the summed
+    // elevation returns to ~0 over the lap (the closure pass absorbs the rest).
     SegmentDef track_layout[] = {
-        { 40,  0.0f,      0.0f },    // Straight
-        { 40,  0.03927f,  0.0f },    // 90 Right
-        { 30,  0.0f,      0.0f },    // Straight
-        { 40, -0.03927f,  0.0f },    // 90 Left
-        { 50,  0.0f,      0.0f },    // Straight
-        { 40,  0.03927f,  0.0f },    // 90 Right
-        { 30,  0.0f,      0.0f },    // Straight
-        { 40,  0.07854f,  0.0f },    // 180 Right
-        { 50,  0.0f,      0.0f },    // Straight
-        { 40,  0.03927f,  0.0f }     // 90 Right
+        { 40,  0.0f,      0.0f },      // Start straight (flat)
+        { 40,  0.03927f,  0.0040f },   // 90 Right, climbing
+        { 30,  0.0f,     -0.0050f },   // Straight over the crest
+        { 40, -0.03927f, -0.0040f },   // 90 Left, descending into the valley
+        { 50,  0.0f,      0.0030f },   // Straight, climbing back to level
+        { 40,  0.03927f,  0.0042f },   // 90 Right, second climb
+        { 30,  0.0f,     -0.0056f },   // Straight, fast drop
+        { 40,  0.07854f,  0.0f },      // 180 Right hairpin (flat)
+        { 50,  0.0f,     -0.0030f },   // Back straight, gentle descent
+        { 40,  0.03927f,  0.00375f }   // Final 90 Right, climbing to the line
     };
     
     int num_defs = sizeof(track_layout) / sizeof(SegmentDef);
@@ -1128,9 +516,9 @@ void generateTrack() {
             
             heading += track_layout[l].curve;
             elevation += track_layout[l].pitch;
-            
-            x += sin(heading) * SEGMENT_LENGTH;
-            z += cos(heading) * SEGMENT_LENGTH;
+
+            x += sinf(heading) * SEGMENT_LENGTH;
+            z += cosf(heading) * SEGMENT_LENGTH;
             y += elevation * SEGMENT_LENGTH;
             
             track[seg_count].x = x;
@@ -1145,9 +533,9 @@ void generateTrack() {
     }
     
     // Seamless Track Closure Math
-    float err_x = track[seg_count-1].x + sin(heading)*SEGMENT_LENGTH - track[0].x;
+    float err_x = track[seg_count-1].x + sinf(heading)*SEGMENT_LENGTH - track[0].x;
     float err_y = track[seg_count-1].y + elevation*SEGMENT_LENGTH - track[0].y;
-    float err_z = track[seg_count-1].z + cos(heading)*SEGMENT_LENGTH - track[0].z;
+    float err_z = track[seg_count-1].z + cosf(heading)*SEGMENT_LENGTH - track[0].z;
     
     for (int i = 0; i < seg_count; i++) {
         float factor = (float)i / (float)seg_count;
@@ -1163,16 +551,16 @@ void generateTrack() {
         float fx = track[next].x - track[i].x;
         float fy = track[next].y - track[i].y;
         float fz = track[next].z - track[i].z;
-        float len = sqrt(fx*fx + fy*fy + fz*fz);
-        
+        float len = sqrtf(fx*fx + fy*fy + fz*fz);
+
         track[i].fx = fx / len;
         track[i].fy = fy / len;
         track[i].fz = fz / len;
-        
+
         // Right vector is perpendicular in the horizontal plane
         float rx = fz;
         float rz = -fx;
-        float len_r = sqrt(rx*rx + rz*rz);
+        float len_r = sqrtf(rx*rx + rz*rz);
         
         track[i].rx = rx / len_r;
         track[i].rz = rz / len_r;
@@ -1184,6 +572,7 @@ void resetRaceState() {
     player_w = 0.0f;
     player_speed = 0.0f;
     player_roll = 0.0f;
+    player_pitch = 0.0f;
     player_steer_angle = 0.0f;
     wheel_spin_angle = 0.0f;
     player_laps = 0;
@@ -1191,9 +580,16 @@ void resetRaceState() {
     race_finish_ms = 0;
     current_lap_ms = 0;
     screen_shake_timer = 0;
-    
+    player_braking = false;
+
     opponents[0] = Opponent{ 2.0f, -0.9f, 0.0f, 0xFFE0, -0.9f, 0, 0 };
     opponents[1] = Opponent{ 3.0f,  0.9f, 0.0f, 0x07FF,  0.9f, 0, 0 };
+    opponents[2] = Opponent{ 4.0f, -0.9f, 0.0f, 0xFD20, -0.9f, 0, 0 };
+    opponents[3] = Opponent{ 5.0f,  0.9f, 0.0f, 0xF81F,  0.9f, 0, 0 };
+
+    for (int i = 0; i < MAX_PARTICLES; i++) {
+        particles[i].life = 0;
+    }
 }
 
 // Physics Loop
@@ -1205,6 +601,7 @@ void updatePhysics(float dt) {
         
         // Speed Auto-Acceleration and Friction
         bool off_road = (fabsf(player_w) > 2.5f);
+        player_braking = (steer_left && steer_right && player_speed > 1.0f);
         if (steer_left && steer_right) {
             // Braking
             float speed_ratio = player_speed / MAX_SPEED;
@@ -1231,7 +628,16 @@ void updatePhysics(float dt) {
             player_speed += accel_rate * dt;
             if (player_speed > MAX_SPEED) player_speed = MAX_SPEED;
         }
-        
+
+        // Dirt spray while off-road
+        if (off_road && player_speed > 30.0f) {
+            for (int d = 0; d < 2; d++) {
+                spawnParticle(160 + random(-42, 43), 124 + random(0, 12),
+                              random(-12, 13) * 0.1f, -random(8, 28) * 0.1f,
+                              random(12, 26), (d & 1) ? 0x9367 : 0x4DE8);
+            }
+        }
+
         // Steer physics & body bank
         float steer_rate = 3.6f;
         float target_roll = 0.0f;
@@ -1248,21 +654,32 @@ void updatePhysics(float dt) {
         player_roll = approachFloat(player_roll, target_roll, TURN_VISUAL_RESPONSE, dt);
         player_steer_angle = approachFloat(player_steer_angle, target_steer_angle, TURN_VISUAL_RESPONSE, dt);
         
-        // Centrifugal curve physics
+        // Centrifugal curve physics. dt-scaled (8.4 * dt == the old 0.14 per
+        // frame at 60 fps) so cornering difficulty no longer depends on the
+        // frame rate -- per-frame application made corners easier at low fps.
         int p_seg = (int)player_segment_float % NUM_SEGMENTS;
         float curve = track[p_seg].curve;
-        float force = curve * (player_speed / 50.0f) * (player_speed / 50.0f) * 0.14f;
+        float force = curve * (player_speed / 50.0f) * (player_speed / 50.0f) * 8.4f * dt;
         player_w -= force;
+
+        // Tilt the car nose up/down to follow the local road grade
+        // (interpolated between segments, eased so crests feel smooth).
+        int pitch_next = (p_seg + 1) % NUM_SEGMENTS;
+        float pitch_frac = player_segment_float - (int)player_segment_float;
+        float slope_fy = track[p_seg].fy * (1.0f - pitch_frac) + track[pitch_next].fy * pitch_frac;
+        player_pitch = approachFloat(player_pitch, -asinf(slope_fy), 5.0f, dt);
         
         // Crash boundary checking
         if (player_w > 3.8f) {
             player_w = 3.8f;
             player_speed *= 0.5f; // lose speed
             screen_shake_timer = 12; // shake camera
+            spawnImpactSparks(212, 122, -1.0f);
         } else if (player_w < -3.8f) {
             player_w = -3.8f;
             player_speed *= 0.5f;
             screen_shake_timer = 12;
+            spawnImpactSparks(108, 122, 1.0f);
         }
         
         // Spin wheels
@@ -1295,6 +712,7 @@ void updatePhysics(float dt) {
         player_speed = 0.0f;
         player_roll = 0.0f;
         player_steer_angle = 0.0f;
+        player_braking = false;
         
         if (millis() - countdown_start_ms > 4000) {
             current_state = PLAYING;
@@ -1306,7 +724,7 @@ void updatePhysics(float dt) {
     
     // Update Opponent AI
     if (current_state == PLAYING) {
-        for (int i = 0; i < 2; i++) {
+        for (int i = 0; i < NUM_OPPONENTS; i++) {
             Opponent& opp = opponents[i];
         
             opp.segment += (opp.speed / 3.6f) * dt / SEGMENT_LENGTH;
@@ -1315,24 +733,21 @@ void updatePhysics(float dt) {
                 opp.laps++;
             }
             
-            // AI lane changing timer
-            if (opp.lane_change_timer <= 0) {
+            // AI lane changing timer (dt-based, so AI behaves the same at any fps)
+            if (opp.lane_change_timer <= 0.0f) {
                 opp.target_lateral = random(-14, 15) / 10.0f; // lane position [-1.4, 1.4]
-                opp.lane_change_timer = random(100, 300);
+                opp.lane_change_timer = random(17, 50) * 0.1f; // 1.7 - 5.0 seconds
             } else {
-                opp.lane_change_timer--;
+                opp.lane_change_timer -= dt;
             }
-            opp.lateral_pos += (opp.target_lateral - opp.lateral_pos) * 0.02f;
-            
-            // AI deceleration on curves
+            opp.lateral_pos = approachFloat(opp.lateral_pos, opp.target_lateral, 1.2f, dt);
+
+            // AI deceleration on curves (3.9/s == the old 0.065 per frame at 60 fps)
             int opp_seg = (int)opp.segment % NUM_SEGMENTS;
             float curve = fabsf(track[opp_seg].curve);
-            float base_speed = (i == 0) ? 175.0f : 168.0f;
-            if (curve > 0.015f) {
-                opp.speed += (base_speed - 38.0f - opp.speed) * 0.065f; // slow down
-            } else {
-                opp.speed += (base_speed - opp.speed) * 0.065f; // speed up
-            }
+            float base_speed = opponent_base_speed[i];
+            float target_speed = (curve > 0.015f) ? (base_speed - 38.0f) : base_speed;
+            opp.speed = approachFloat(opp.speed, target_speed, 3.9f, dt);
             
             // Collision: Player vs Opponent
             float dist_seg = fabsf(player_segment_float - opp.segment);
@@ -1344,6 +759,8 @@ void updatePhysics(float dt) {
                     player_speed *= 0.75f; // player loses speed
                     opp.speed *= 0.8f;     // opponent loses speed
                     screen_shake_timer = 8;
+                    spawnImpactSparks(160 + (player_w > opp.lateral_pos ? -18 : 18), 112,
+                                      player_w > opp.lateral_pos ? 1.0f : -1.0f);
                     
                     // bounce apart
                     if (player_w > opp.lateral_pos) {
@@ -1380,8 +797,8 @@ void renderTrackAndObjects() {
     float dy = target_y - cam_y;
     float dz = target_z - cam_z;
     
-    cam_yaw = atan2(dx, dz);
-    cam_pitch = atan2(dy, sqrt(dx*dx + dz*dz));
+    cam_yaw = atan2f(dx, dz);
+    cam_pitch = atan2f(dy, sqrtf(dx*dx + dz*dz));
     updateCameraTrig();
     
     // Apply Crash Camera Shake
@@ -1394,13 +811,10 @@ void renderTrackAndObjects() {
         center_y = 85.0f;
     }
     
-    // Rotate world light vector to camera space
-    float lx1 = light_dir_x * cam_cos_yaw - light_dir_z * cam_sin_yaw;
-    float lz1 = light_dir_x * cam_sin_yaw + light_dir_z * cam_cos_yaw;
-    float ly1 = light_dir_y;
-    cam_light_x = lx1;
-    cam_light_y = ly1 * cam_cos_pitch - lz1 * cam_sin_pitch;
-    cam_light_z = ly1 * cam_sin_pitch + lz1 * cam_cos_pitch;
+    // The race is lit by the fixed world-space sun (the menu animates this).
+    g_light_x = light_dir_x;
+    g_light_y = light_dir_y;
+    g_light_z = light_dir_z;
     
     // Render Parallax Environment
     int horizon_y = (int)(center_y + cam_pitch * fov);
@@ -1419,6 +833,9 @@ void renderTrackAndObjects() {
         float r_curb_x, r_curb_y;
         float line_l_x, line_l_y;
         float line_r_x, line_r_y;
+        float l_grnd_x, l_grnd_y;
+        float r_grnd_x, r_grnd_y;
+        bool offview;
     };
     
     static RoadProjection road_proj[ROAD_DRAW_SEGMENTS + 2];
@@ -1438,17 +855,120 @@ void renderTrackAndObjects() {
                      road_proj[i].line_l_x, road_proj[i].line_l_y, scratch_z);
         projectPoint(track[seg].x + track[seg].rx * line_w, track[seg].y, track[seg].z + track[seg].rz * line_w,
                      road_proj[i].line_r_x, road_proj[i].line_r_y, scratch_z);
+        // Terrain skirt edges, following track elevation. The width adapts to
+        // the segment's distance (just enough to cover the screen laterally
+        // at that depth), and each side's corner is then clipped against a
+        // slightly expanded view frustum IN CAMERA SPACE. Camera-space
+        // coordinates are exactly linear along the lateral ray, so every
+        // frustum plane yields a closed-form width cap. This is what keeps
+        // corner geometry small: merely keeping a corner in front of the
+        // near plane still lets it project thousands of pixels off-screen on
+        // tight corners (the screen-covering "grass mountain" bug).
+        {
+            // Segment centerline in camera space (same transform as projectPoint).
+            float wxc = track[seg].x - cam_x;
+            float wyc = track[seg].y - cam_y;
+            float wzc = track[seg].z - cam_z;
+            float rz1 = wxc * cam_sin_yaw + wzc * cam_cos_yaw;
+            float xc = wxc * cam_cos_yaw - wzc * cam_sin_yaw;
+            float yc = wyc * cam_cos_pitch - rz1 * cam_sin_pitch;
+            float zc = wyc * cam_sin_pitch + rz1 * cam_cos_pitch;
+
+            // View culling: on corners (especially the hairpin) many segments
+            // that are ahead along the track are behind or far beside the
+            // camera. Rasterizing their off-screen quads is pure waste, so
+            // flag them; the draw loop skips whole strips when both ends are
+            // off-view. The side cone (|x| <= 3*z + 8) is wider than the
+            // skirt frustum so visible geometry is never clipped by this.
+            road_proj[i].offview = (i >= 2) &&
+                                   ((zc < 0.05f) || (fabsf(xc) > zc * 3.0f + 8.0f));
+
+            float zw = (zc < 0.1f) ? 0.1f : zc;
+            float ground_w = (ROAD_WIDTH * 0.5f + CURB_WIDTH + 1.5f) + zw * (300.0f / fov);
+            if (ground_w > GROUND_HALF_WIDTH) ground_w = GROUND_HALF_WIDTH;
+            float gw_l = ground_w, gw_r = ground_w;
+
+            if (i >= 2) {
+                // Camera-space direction of one unit along the segment's right vector.
+                float q   = track[seg].rx * cam_sin_yaw + track[seg].rz * cam_cos_yaw;
+                float dxr = track[seg].rx * cam_cos_yaw - track[seg].rz * cam_sin_yaw;
+                float dyr = -q * cam_sin_pitch;
+                float dzr =  q * cam_cos_pitch;
+
+                // Expanded frustum: |x| <= KX*z (~+/-470 px), |y| <= KY*z
+                // (~+/-360 px), z >= Z_SAFE. Each plane: A + s*t*B >= 0.
+                // (Segments 0-1 keep full stretch: they fill the bottom of
+                // the screen by design, exactly like the road quads.)
+                const float KX = 2.6f;
+                const float KY = 2.0f;
+                const float Z_SAFE = 0.35f;
+                float A[5] = { zc - Z_SAFE,
+                               KX * zc - xc, KX * zc + xc,
+                               KY * zc - yc, KY * zc + yc };
+                float B[5] = { dzr,
+                               KX * dzr - dxr, KX * dzr + dxr,
+                               KY * dzr - dyr, KY * dzr + dyr };
+                for (int side = 0; side < 2; side++) {
+                    float s = side ? 1.0f : -1.0f;
+                    float t = ground_w;
+                    for (int p = 0; p < 5; p++) {
+                        float Bp = s * B[p];
+                        if (A[p] + Bp * t < 0.0f) {
+                            t = (Bp < -1e-5f) ? (-A[p] / Bp) : 0.05f;
+                            if (t < 0.05f) t = 0.05f;
+                        }
+                    }
+                    if (side) gw_r = t; else gw_l = t;
+                }
+            }
+
+            float drop_l = GROUND_EDGE_DROP * (gw_l / GROUND_HALF_WIDTH);
+            float drop_r = GROUND_EDGE_DROP * (gw_r / GROUND_HALF_WIDTH);
+            projectPoint(track[seg].x - track[seg].rx * gw_l, track[seg].y - drop_l,
+                         track[seg].z - track[seg].rz * gw_l,
+                         road_proj[i].l_grnd_x, road_proj[i].l_grnd_y, scratch_z);
+            projectPoint(track[seg].x + track[seg].rx * gw_r, track[seg].y - drop_r,
+                         track[seg].z + track[seg].rz * gw_r,
+                         road_proj[i].r_grnd_x, road_proj[i].r_grnd_y, scratch_z);
+            // Near-fill skirts (segments 0-1) only need to reach past the
+            // screen edge; their borders are grass-on-grass, so pulling the
+            // stretched points way in is invisible and much cheaper to fill.
+            // Frustum-clipped corners are already inside this radius.
+            pullInRadial(road_proj[i].l_grnd_x, road_proj[i].l_grnd_y, 700.0f);
+            pullInRadial(road_proj[i].r_grnd_x, road_proj[i].r_grnd_y, 700.0f);
+        }
     }
     
     for (int i = ROAD_DRAW_SEGMENTS; i >= 0; i--) {
         int seg = (start_i + i) % NUM_SEGMENTS;
         RoadProjection& near_p = road_proj[i];
         RoadProjection& far_p = road_proj[i + 1];
-        
-        // Colors
+        if (near_p.offview && far_p.offview) continue; // strip entirely outside the view
+        uint8_t fog_a = fog_table[i];
+
+        // Colors, faded into the horizon haze with distance. The fog also
+        // hides the draw-distance pop-in at the last segments.
         uint16_t road_color = track[seg].is_alternate ? 0x39E7 : 0x4208; // alternating greys
         uint16_t curb_color = track[seg].is_alternate ? 0xF800 : 0xFFFF; // alternating red/white
-        
+        uint16_t line_color = 0xFFFF;
+        if (fog_a) {
+            road_color = blend565(road_color, FOG_COLOR, fog_a);
+            curb_color = blend565(curb_color, FOG_COLOR, fog_a);
+            line_color = blend565(line_color, FOG_COLOR, fog_a);
+        }
+
+        // Terrain skirts: wide grass polygons attached to the road edges and
+        // following the track's elevation, so hills are solid ground instead
+        // of a floating ribbon. Two alternating greens give the classic
+        // striped-infield look; the flat gradient backdrop only remains
+        // visible near the horizon, where fog blends everything together.
+        uint16_t grass_color = track[seg].is_alternate ? 0x3C45 : 0x33C4;
+        if (fog_a) grass_color = blend565(grass_color, FOG_COLOR, fog_a);
+        drawQuad(near_p.l_grnd_x, near_p.l_grnd_y, near_p.l_curb_x, near_p.l_curb_y,
+                 far_p.l_curb_x, far_p.l_curb_y, far_p.l_grnd_x, far_p.l_grnd_y, grass_color);
+        drawQuad(near_p.r_curb_x, near_p.r_curb_y, near_p.r_grnd_x, near_p.r_grnd_y,
+                 far_p.r_grnd_x, far_p.r_grnd_y, far_p.r_curb_x, far_p.r_curb_y, grass_color);
+
         // Draw Curbs
         drawQuad(near_p.l_curb_x, near_p.l_curb_y, near_p.l_road_x, near_p.l_road_y,
                  far_p.l_road_x, far_p.l_road_y, far_p.l_curb_x, far_p.l_curb_y, curb_color);
@@ -1462,7 +982,7 @@ void renderTrackAndObjects() {
         // Draw Dashed white line
         if ((seg / 2) % 2 == 0) {
             drawQuad(near_p.line_l_x, near_p.line_l_y, near_p.line_r_x, near_p.line_r_y,
-                     far_p.line_r_x, far_p.line_r_y, far_p.line_l_x, far_p.line_l_y, 0xFFFF);
+                     far_p.line_r_x, far_p.line_r_y, far_p.line_l_x, far_p.line_l_y, line_color);
         }
         
         // Start/finish checker strip
@@ -1478,67 +998,78 @@ void renderTrackAndObjects() {
                 float f0y = far_p.l_road_y + (far_p.r_road_y - far_p.l_road_y) * t0;
                 float f1x = far_p.l_road_x + (far_p.r_road_x - far_p.l_road_x) * t1;
                 float f1y = far_p.l_road_y + (far_p.r_road_y - far_p.l_road_y) * t1;
-                drawQuad(n0x, n0y, n1x, n1y, f1x, f1y, f0x, f0y, (c & 1) ? 0x0000 : 0xFFFF);
+                uint16_t check_color = (c & 1) ? 0x0000 : 0xFFFF;
+                if (fog_a) check_color = blend565(check_color, FOG_COLOR, fog_a);
+                drawQuad(n0x, n0y, n1x, n1y, f1x, f1y, f0x, f0y, check_color);
             }
         }
-        
+
         if (i <= SCENERY_DRAW_SEGMENTS) {
             // Keep object draw distance unchanged while testing a longer road horizon.
-            drawSegmentScenery(seg);
-            drawSegmentOpponents(seg);
+            drawSegmentScenery(seg, fog_a);
+            drawSegmentOpponents(seg, fog_a);
         }
     }
     
     // Render Player Car in the foreground last (forces it on top)
     if (current_state == PLAYING || current_state == COUNTDOWN || current_state == FINISHED) {
         float p_yaw = cam_yaw; // Lock to camera for solid 3D perspective
-        
+
         // Bouncing hover/engine vibration
         float bounce_y = 0.0f;
         if (player_speed > 0.0f && current_state == PLAYING) {
-            bounce_y = 0.018f * sin(millis() * 0.065f * (player_speed / MAX_SPEED + 0.3f));
+            bounce_y = 0.018f * sinf(millis() * 0.065f * (player_speed / MAX_SPEED + 0.3f));
         }
-        
+
         float p_x, p_y, p_z;
         cameraRelativeToWorld(0.0f, PLAYER_CAR_CAMERA_Y + bounce_y, PLAYER_CAR_CAMERA_Z, p_x, p_y, p_z);
-        
+
+        // Ground shadow first; the car is camera-locked so the shadow is a
+        // fixed-position translucent darkening of whatever is under it.
+        shadowEllipse((int)center_x + (int)(player_roll * 90.0f), 129, 30, 12, 10);
+
         // Draw body
-        draw3DModel(car_vertices, CAR_NUM_VERTICES, car_faces, CAR_NUM_FACES,
+        draw3DModel(car_vertices, CAR_NUM_VERTICES, car_faces, car_normals, CAR_NUM_FACES,
                     p_x, p_y, p_z,
-                    0.0f, p_yaw + player_steer_angle, player_roll,
-                    1.0f, 0x021F); // Subaru blue
+                    player_pitch, p_yaw + player_steer_angle, player_roll,
+                    1.0f, 0x021F, 0); // Subaru blue
         drawCarRearGlass(p_x, p_y, p_z,
-                         0.0f, p_yaw + player_steer_angle, player_roll,
-                         1.0f);
+                         player_pitch, p_yaw + player_steer_angle, player_roll,
+                         1.0f, player_braking && current_state == PLAYING);
+
+        updateAndDrawParticles();
     }
 }
 
 // Side of Road Scenery Placement
-void drawSegmentScenery(int seg) {
+void drawSegmentScenery(int seg, uint8_t fog_a) {
     float side_offset = 3.8f;
     float bill_offset = 4.2f;
     bool forest_zone = (seg >= 68 && seg < 112) ||
                        (seg >= 186 && seg < 232) ||
                        (seg >= 304 && seg < 344);
-    
+
     if (seg == 0) {
-        drawStartFinishGantry(seg);
+        drawStartFinishGantry(seg, fog_a);
     }
-    if (seg == 252) {
-        drawTracksideLake(seg);
+    // The lake lives in the hairpin zone (segments 270-309), the one stretch
+    // of track that is dead flat -- a water surface on a grade looks wrong.
+    if (seg == 290) {
+        drawTracksideLake(seg, fog_a);
     }
-    
+
     // Draw Bridge Arch (every 40 segments)
     if (seg % 40 == 20) {
-        draw3DModel(bridge_vertices, BRIDGE_NUM_VERTICES, bridge_faces, BRIDGE_NUM_FACES,
+        draw3DModel(bridge_vertices, BRIDGE_NUM_VERTICES, bridge_faces, bridge_normals, BRIDGE_NUM_FACES,
                     track[seg].x, track[seg].y, track[seg].z,
-                    0.0f, atan2(track[seg].fx, track[seg].fz), 0.0f,
-                    1.0f, 0x5AEB);
+                    0.0f, atan2f(track[seg].fx, track[seg].fz), 0.0f,
+                    1.0f, 0x5AEB, fog_a);
     }
-    
+
     // Draw 3D Grass
     if (seg % 2 == 0) {
         static const float grass_offsets[] = { 1.2f, 2.5f, 4.0f };
+        uint16_t blade_color = fog_a ? blend565(0x2D84, FOG_COLOR, fog_a) : 0x2D84;
         for (int side = -1; side <= 1; side += 2) {
             for (int go = 0; go < 3; go++) {
                 float jitter = stableJitter(seg, side, go, 0);
@@ -1549,38 +1080,38 @@ void drawSegmentScenery(int seg) {
                 if (projectPoint(gx, track[seg].y, gz, sx, sy, sz)) {
                     if (sz > 2.0f && sz < 40.0f) {
                         int h = (int)(25.0f / sz);
-                        sprite.drawLine((int16_t)sx, (int16_t)sy, (int16_t)sx - h/2, (int16_t)sy - h, 0x2D84);
-                        sprite.drawLine((int16_t)sx, (int16_t)sy, (int16_t)sx + h/2, (int16_t)sy - h, 0x2D84);
+                        sprite.drawLine((int16_t)sx, (int16_t)sy, (int16_t)sx - h/2, (int16_t)sy - h, blade_color);
+                        sprite.drawLine((int16_t)sx, (int16_t)sy, (int16_t)sx + h/2, (int16_t)sy - h, blade_color);
                     }
                 }
             }
         }
     }
-    
+
     // Draw Tree Left (every 8 segments)
     if (seg % 8 == 0) {
         float tx = track[seg].x - track[seg].rx * side_offset;
         float ty = track[seg].y;
         float tz = track[seg].z - track[seg].rz * side_offset;
-        
-        draw3DModel(tree_vertices, TREE_NUM_VERTICES, tree_faces, TREE_NUM_FACES,
+
+        draw3DModel(tree_vertices, TREE_NUM_VERTICES, tree_faces, tree_normals, TREE_NUM_FACES,
                     tx, ty, tz,
                     0.0f, 0.0f, 0.0f,
-                    0.9f + 0.15f * sin(seg), 0x04C0);
+                    0.9f + 0.15f * sinf((float)seg), 0x04C0, fog_a);
     }
-    
+
     // Draw Tree Right (every 8 segments, offset by 4)
     if (seg % 8 == 4) {
         float tx = track[seg].x + track[seg].rx * side_offset;
         float ty = track[seg].y;
         float tz = track[seg].z + track[seg].rz * side_offset;
-        
-        draw3DModel(tree_vertices, TREE_NUM_VERTICES, tree_faces, TREE_NUM_FACES,
+
+        draw3DModel(tree_vertices, TREE_NUM_VERTICES, tree_faces, tree_normals, TREE_NUM_FACES,
                     tx, ty, tz,
                     0.0f, 0.0f, 0.0f,
-                    0.9f + 0.15f * cos(seg), 0x04C0);
+                    0.9f + 0.15f * cosf((float)seg), 0x04C0, fog_a);
     }
-    
+
     // Dense forest pockets in a few parts of the lap
     if (forest_zone) {
         static const float forest_offsets[] = { 5.1f, 6.8f };
@@ -1588,48 +1119,48 @@ void drawSegmentScenery(int seg) {
             int side_index = (side > 0) ? 1 : 0;
             for (int fo = 0; fo < 2; fo++) {
                 if (((seg + fo + side_index) & 1) != 0) continue;
-                
+
                 float offset = forest_offsets[fo] + stableJitter(seg, side, fo, 5) * 0.8f;
                 float tx = track[seg].x + track[seg].rx * side * offset;
                 float ty = track[seg].y;
                 float tz = track[seg].z + track[seg].rz * side * offset;
                 float scale = 0.80f + 0.14f * ((seg + fo + side_index) % 3);
-                
-                drawTreeImpostor(tx, ty, tz, scale);
+
+                drawTreeImpostor(tx, ty, tz, scale, fog_a);
             }
         }
     }
-    
+
     // Draw Billboard Left (every 16 segments)
     if (seg % 16 == 5) {
         float bx = track[seg].x - track[seg].rx * bill_offset;
         float by = track[seg].y;
         float bz = track[seg].z - track[seg].rz * bill_offset;
-        float rot_y = atan2(track[seg].fx, track[seg].fz) + 1.5707f; // face road
-        
-        drawBillboard(bx, by, bz, rot_y, 0.8f, 0x001F); // Blue
+        float rot_y = atan2f(track[seg].fx, track[seg].fz) + 1.5707f; // face road
+
+        drawBillboard(bx, by, bz, rot_y, 0.8f, 0x001F, fog_a); // Blue
     }
-    
+
     // Draw Billboard Right (every 16 segments)
     if (seg % 16 == 13) {
         float bx = track[seg].x + track[seg].rx * bill_offset;
         float by = track[seg].y;
         float bz = track[seg].z + track[seg].rz * bill_offset;
-        float rot_y = atan2(track[seg].fx, track[seg].fz) - 1.5707f; // face road
-        
-        drawBillboard(bx, by, bz, rot_y, 0.8f, 0xF800); // Red
+        float rot_y = atan2f(track[seg].fx, track[seg].fz) - 1.5707f; // face road
+
+        drawBillboard(bx, by, bz, rot_y, 0.8f, 0xF800, fog_a); // Red
     }
 }
 
-void drawStartFinishGantry(int seg) {
-    float yaw = atan2(track[seg].fx, track[seg].fz);
-    draw3DModel(bridge_vertices, BRIDGE_NUM_VERTICES, gantry_faces, BRIDGE_NUM_FACES,
+void drawStartFinishGantry(int seg, uint8_t fog_a) {
+    float yaw = atan2f(track[seg].fx, track[seg].fz);
+    draw3DModel(bridge_vertices, BRIDGE_NUM_VERTICES, gantry_faces, bridge_normals, BRIDGE_NUM_FACES,
                 track[seg].x, track[seg].y, track[seg].z,
                 0.0f, yaw, 0.0f,
-                1.05f, 0xFFFF);
+                1.05f, 0xFFFF, fog_a);
 }
 
-void drawTracksideLake(int seg) {
+void drawTracksideLake(int seg, uint8_t fog_a) {
     static const float oval_x[] = { 1.00f, 0.70f, 0.00f, -0.70f, -1.00f, -0.70f, 0.00f, 0.70f };
     static const float oval_z[] = { 0.00f, 0.70f, 1.00f,  0.70f,  0.00f, -0.70f, -1.00f, -0.70f };
     
@@ -1648,7 +1179,11 @@ void drawTracksideLake(int seg) {
     Point2D water[8];
     float center_sx, center_sy, center_sz;
     if (!projectPoint(cxw, cyw, czw, center_sx, center_sy, center_sz)) return;
-    if (center_sz <= 2.0f || center_sz > 52.0f) return;
+    // The near gate must exceed the shore radius (9.5): otherwise shore
+    // vertices can cross behind the camera while the center is still ahead,
+    // and their near-plane-stretched projections fan wedge triangles across
+    // the screen. By z=11 the lake is fully off-screen to the side anyway.
+    if (center_sz <= 11.0f || center_sz > 52.0f) return;
     
     for (int i = 0; i < 8; i++) {
         float sx_axis = track[seg].rx * side * oval_x[i];
@@ -1665,16 +1200,18 @@ void drawTracksideLake(int seg) {
                      water[i].x, water[i].y, scratch_z);
     }
     
+    uint16_t shore_color = fog_a ? blend565(0xA5A6, FOG_COLOR, fog_a) : 0xA5A6;
     for (int i = 0; i < 8; i++) {
         int next = (i + 1) & 7;
         sprite.fillTriangle((int16_t)center_sx, (int16_t)center_sy,
                             (int16_t)shore[i].x, (int16_t)shore[i].y,
                             (int16_t)shore[next].x, (int16_t)shore[next].y,
-                            0xA5A6);
+                            shore_color);
     }
     for (int i = 0; i < 8; i++) {
         int next = (i + 1) & 7;
         uint16_t water_color = (i & 1) ? 0x04BF : 0x039F;
+        if (fog_a) water_color = blend565(water_color, FOG_COLOR, fog_a);
         sprite.fillTriangle((int16_t)center_sx, (int16_t)center_sy,
                             (int16_t)water[i].x, (int16_t)water[i].y,
                             (int16_t)water[next].x, (int16_t)water[next].y,
@@ -1690,120 +1227,160 @@ void drawTracksideLake(int seg) {
 }
 
 // Render Opponents
-void drawSegmentOpponents(int seg) {
-    for (int i = 0; i < 2; i++) {
+void drawSegmentOpponents(int seg, uint8_t fog_a) {
+    for (int i = 0; i < NUM_OPPONENTS; i++) {
         int opp_seg = (int)opponents[i].segment % NUM_SEGMENTS;
         if (opp_seg == seg) {
             float ox, oy, oz, orx, orz;
             getTrackPosition(opponents[i].segment, opponents[i].lateral_pos, ox, oy, oz, orx, orz);
-            
-            float opp_yaw = atan2(track[opp_seg].fx, track[opp_seg].fz);
-            
-            draw3DModel(lod_car_vertices, LOD_CAR_NUM_VERTICES, lod_car_faces, LOD_CAR_NUM_FACES,
+
+            float opp_yaw = atan2f(track[opp_seg].fx, track[opp_seg].fz);
+
+            // Translucent ground shadow keeps the car visually planted.
+            float ssx, ssy, ssz;
+            projectPoint(ox, oy + 0.02f, oz, ssx, ssy, ssz);
+            if (ssz > 1.5f && ssz < 26.0f) {
+                int srx = (int)(0.80f * fov / ssz);
+                int sry = srx / 3;
+                if (sry < 2) sry = 2;
+                shadowEllipse((int)ssx, (int)ssy, srx, sry, 9);
+            }
+
+            draw3DModel(lod_car_vertices, LOD_CAR_NUM_VERTICES, lod_car_faces, lod_car_normals, LOD_CAR_NUM_FACES,
                         ox, oy, oz,
                         0.0f, opp_yaw, 0.0f,
-                        1.0f, opponents[i].color);
-            
+                        1.0f, opponents[i].color, fog_a);
+
             bool braking = fabsf(track[opp_seg].curve) > 0.015f;
             drawOpponentBrakeLights(ox, oy, oz, opp_yaw, braking);
         }
     }
 }
 
-// 3D Object Renderer (Rotation + Scaling + Camera view matrix + Projection)
-void draw3DModel(const Point3D* vertices, int num_vertices, const Face* faces, int num_faces, 
-                 float pos_x, float pos_y, float pos_z, 
-                 float rot_x, float rot_y, float rot_z, 
-                 float scale, uint16_t base_color) {
+// 3D Object Renderer.
+// - One fused matrix A = Camera * ModelRotation * scale per call, so each
+//   vertex is a single 3x3 multiply-add instead of two chained rotations.
+// - Exact backface culling using the precomputed model-space face normals:
+//   a face is visible iff the eye is on its front side (dot(n, eye - v0) > 0).
+//   Double-sided faces (open sheets like the billboard) are never culled.
+// - Lighting is one dot product per face against the model-space light, and
+//   shading/fog use integer RGB565 math. Culled/behind faces never get sorted.
+void draw3DModel(const Point3D* vertices, int num_vertices,
+                 const Face* faces, const Point3D* normals, int num_faces,
+                 float pos_x, float pos_y, float pos_z,
+                 float rot_x, float rot_y, float rot_z,
+                 float scale, uint16_t base_color, uint8_t fog_a) {
     static Point2D projected[MODEL_MAX_VERTICES];
-    static Point3D cam_space[MODEL_MAX_VERTICES];
     static float camera_z[MODEL_MAX_VERTICES];
-    
-    if (num_vertices > MODEL_MAX_VERTICES) return;
-    bool fast_complex_shading = (num_faces > 96);
-    
-    float cx = cos(rot_x), sx = sin(rot_x);
-    float cy = cos(rot_y), sy = sin(rot_y);
-    float cz = cos(rot_z), sz = sin(rot_z);
-    
-    float c_cam_yaw = cam_cos_yaw, s_cam_yaw = cam_sin_yaw;
-    float c_cam_pitch = cam_cos_pitch, s_cam_pitch = cam_sin_pitch;
-    
-    for (int i = 0; i < num_vertices; i++) {
-        float lx = vertices[i].x * scale;
-        float ly = vertices[i].y * scale;
-        float lz = vertices[i].z * scale;
-        
-        // Z-axis Roll
-        float x1 = lx * cz - ly * sz;
-        float y1 = lx * sz + ly * cz;
-        float z1 = lz;
-        
-        // X-axis Pitch
-        float x2 = x1;
-        float y2 = y1 * cx - z1 * sx;
-        float z2 = y1 * sx + z1 * cx;
-        
-        // Y-axis Yaw
-        float rx_world = x2 * cy + z2 * sy;
-        float ry_world = y2;
-        float rz_world = -x2 * sy + z2 * cy;
-        
-        // Translate to World Space
-        float wx = rx_world + pos_x;
-        float wy = ry_world + pos_y;
-        float wz = rz_world + pos_z;
-        
-        // Camera Space Offset
-        float cx_cam = wx - cam_x;
-        float cy_cam = wy - cam_y;
-        float cz_cam = wz - cam_z;
-        
-        // Camera Yaw
-        float rx_cam1 = cx_cam * c_cam_yaw - cz_cam * s_cam_yaw;
-        float rz_cam1 = cx_cam * s_cam_yaw + cz_cam * c_cam_yaw;
-        float ry_cam1 = cy_cam;
-        
-        // Camera Pitch
-        float rx_cam = rx_cam1;
-        float ry_cam = ry_cam1 * c_cam_pitch - rz_cam1 * s_cam_pitch;
-        float rz_cam = ry_cam1 * s_cam_pitch + rz_cam1 * c_cam_pitch;
-        
-        camera_z[i] = rz_cam;
-        cam_space[i] = { rx_cam, ry_cam, rz_cam };
-        
-        if (rz_cam > 0.1f) {
-            projected[i].x = center_x + (rx_cam * fov / rz_cam);
-            projected[i].y = center_y - (ry_cam * fov / rz_cam);
-        } else {
-            projected[i].x = -9999.0f;
-            projected[i].y = -9999.0f;
-        }
-    }
-    
+
     struct FaceRenderData {
-        int index;
         float avg_z;
-        bool behind;
+        uint16_t index;
+        uint16_t color;
     };
     static FaceRenderData face_data[MODEL_MAX_FACES];
-    if (num_faces > MODEL_MAX_FACES) return;
-    
+
+    if (num_vertices > MODEL_MAX_VERTICES || num_faces > MODEL_MAX_FACES) return;
+
+    float cx = 1.0f, sx = 0.0f, cy = 1.0f, sy = 0.0f, cz = 1.0f, sz = 0.0f;
+    if (rot_x != 0.0f) { cx = cosf(rot_x); sx = sinf(rot_x); }
+    if (rot_y != 0.0f) { cy = cosf(rot_y); sy = sinf(rot_y); }
+    if (rot_z != 0.0f) { cz = cosf(rot_z); sz = sinf(rot_z); }
+
+    // Model rotation matrix M = Ry * Rx * Rz (roll, then pitch, then yaw).
+    float m00 = cy * cz + sy * sx * sz, m01 = -cy * sz + sy * sx * cz, m02 = sy * cx;
+    float m10 = cx * sz,                m11 = cx * cz,                 m12 = -sx;
+    float m20 = -sy * cz + cy * sx * sz, m21 = sy * sz + cy * sx * cz, m22 = cy * cx;
+
+    // Camera matrix C (yaw then pitch, same convention as projectPoint).
+    float cyc = cam_cos_yaw, syc = cam_sin_yaw, cp = cam_cos_pitch, sp = cam_sin_pitch;
+    float c00 = cyc,       c02 = -syc;
+    float c10 = -syc * sp, c11 = cp, c12 = -cyc * sp;
+    float c20 = syc * cp,  c21 = sp, c22 = cyc * cp;
+
+    // Fused vertex transform: cam = A * v + b, with A = C * M * scale.
+    float a00 = (c00 * m00 + c02 * m20) * scale;
+    float a01 = (c00 * m01 + c02 * m21) * scale;
+    float a02 = (c00 * m02 + c02 * m22) * scale;
+    float a10 = (c10 * m00 + c11 * m10 + c12 * m20) * scale;
+    float a11 = (c10 * m01 + c11 * m11 + c12 * m21) * scale;
+    float a12 = (c10 * m02 + c11 * m12 + c12 * m22) * scale;
+    float a20 = (c20 * m00 + c21 * m10 + c22 * m20) * scale;
+    float a21 = (c20 * m01 + c21 * m11 + c22 * m21) * scale;
+    float a22 = (c20 * m02 + c21 * m12 + c22 * m22) * scale;
+
+    float dx = pos_x - cam_x, dy = pos_y - cam_y, dz = pos_z - cam_z;
+    float b0 = c00 * dx + c02 * dz;
+    float b1 = c10 * dx + c11 * dy + c12 * dz;
+    float b2 = c20 * dx + c21 * dy + c22 * dz;
+
+    // Whole model at/behind the camera plane: every on-screen part would be
+    // clipped face-by-face anyway, and anything this close but off-axis
+    // projects far off-screen. Skip the entire transform.
+    if (b2 < 0.4f) return;
+
+    // Eye position and light direction in model space (M is orthonormal, so
+    // its inverse is the transpose; uniform scale only affects the eye).
+    float inv_s = 1.0f / scale;
+    float ex = (m00 * -dx + m10 * -dy + m20 * -dz) * inv_s;
+    float ey = (m01 * -dx + m11 * -dy + m21 * -dz) * inv_s;
+    float ez = (m02 * -dx + m12 * -dy + m22 * -dz) * inv_s;
+    float lx = m00 * g_light_x + m10 * g_light_y + m20 * g_light_z;
+    float ly = m01 * g_light_x + m11 * g_light_y + m21 * g_light_z;
+    float lz = m02 * g_light_x + m12 * g_light_y + m22 * g_light_z;
+
+    for (int i = 0; i < num_vertices; i++) {
+        float vx = vertices[i].x, vy = vertices[i].y, vz = vertices[i].z;
+        float zc = a20 * vx + a21 * vy + a22 * vz + b2;
+        camera_z[i] = zc;
+        if (zc > 0.1f) {
+            float inv = fov / zc;
+            projected[i].x = center_x + (a00 * vx + a01 * vy + a02 * vz + b0) * inv;
+            projected[i].y = center_y - (a10 * vx + a11 * vy + a12 * vz + b1) * inv;
+        }
+    }
+
+    // Cull, light, and gather visible faces.
+    int count = 0;
     for (int i = 0; i < num_faces; i++) {
         const Face& f = faces[i];
-        bool behind = false;
+        const Point3D& n = normals[i];
+        const Point3D& p0 = vertices[f.indices[0]];
+
+        float facing = n.x * (ex - p0.x) + n.y * (ey - p0.y) + n.z * (ez - p0.z);
+        float light_sign = 1.0f;
+        if (facing <= 0.0f) {
+            if (!(f.flags & 1)) continue; // backface of a closed surface: invisible
+            light_sign = -1.0f;           // double-sided sheet: light the visible side
+        }
+
         float sum_z = 0.0f;
+        bool behind = false;
         for (int v = 0; v < f.num_vertices; v++) {
             float z = camera_z[f.indices[v]];
-            if (z <= 0.1f) behind = true;
+            if (z <= 0.1f) { behind = true; break; }
             sum_z += z;
         }
-        face_data[i] = { i, sum_z / f.num_vertices, behind };
+        if (behind) continue;
+
+        float diff = (n.x * lx + n.y * ly + n.z * lz) * light_sign;
+        if (diff < 0.0f) diff = 0.0f;
+        int i32 = (int)(19.2f + 13.4f * diff); // ambient 0.60 + diffuse 0.42, in 1/32 steps
+        if (i32 > 32) i32 = 32;
+
+        uint16_t col = (f.color == 0xFFFF) ? base_color : f.color;
+        col = shade565(col, (uint8_t)i32);
+        if (fog_a) col = blend565(col, FOG_COLOR, fog_a);
+
+        face_data[count].avg_z = sum_z / f.num_vertices;
+        face_data[count].index = (uint16_t)i;
+        face_data[count].color = col;
+        count++;
     }
-    
+
     // Painter's sort: furthest faces first.
-    for (int gap = num_faces / 2; gap > 0; gap /= 2) {
-        for (int i = gap; i < num_faces; i++) {
+    for (int gap = count / 2; gap > 0; gap /= 2) {
+        for (int i = gap; i < count; i++) {
             FaceRenderData temp = face_data[i];
             int j = i;
             while (j >= gap && face_data[j - gap].avg_z < temp.avg_z) {
@@ -1813,67 +1390,23 @@ void draw3DModel(const Point3D* vertices, int num_vertices, const Face* faces, i
             face_data[j] = temp;
         }
     }
-    
-    // Render Faces
-    for (int fi = 0; fi < num_faces; fi++) {
-        if (face_data[fi].behind) continue;
-        int i = face_data[fi].index;
-        const Face& f = faces[i];
-        
+
+    for (int fi = 0; fi < count; fi++) {
+        const Face& f = faces[face_data[fi].index];
+        uint16_t shaded = face_data[fi].color;
         int i0 = f.indices[0];
         int i1 = f.indices[1];
         int i2 = f.indices[2];
-        uint16_t color_to_use = (f.color == 0xFFFF) ? base_color : f.color;
-        
-        // Normal computation in camera space
-        float ax = cam_space[i1].x - cam_space[i0].x;
-        float ay = cam_space[i1].y - cam_space[i0].y;
-        float az = cam_space[i1].z - cam_space[i0].z;
-        
-        float bx = cam_space[i2].x - cam_space[i0].x;
-        float by = cam_space[i2].y - cam_space[i0].y;
-        float bz = cam_space[i2].z - cam_space[i0].z;
-        
-        float nx = ay * bz - az * by;
-        float ny = az * bx - ax * bz;
-        float nz = ax * by - ay * bx;
-        
-        if (nz > 0.0f) { nx = -nx; ny = -ny; nz = -nz; } // Point towards camera
-        
-        float intensity;
-        if (fast_complex_shading) {
-            float facing = -nz / (fabsf(nx) + fabsf(ny) + fabsf(nz) + 0.001f);
-            if (facing > 1.0f) facing = 1.0f;
-            if (facing < 0.0f) facing = 0.0f;
-            intensity = 0.70f + 0.30f * facing;
-        } else {
-            float len = sqrt(nx*nx + ny*ny + nz*nz);
-            if (len > 0.0f) {
-                nx /= len; ny /= len; nz /= len;
-            }
-            
-            // Dot product flat lighting
-            float dot = nx * cam_light_x + ny * cam_light_y + nz * cam_light_z;
-            intensity = 0.66f + 0.34f * dot; // high noon ambient + diffuse
-            if (intensity > 1.0f) intensity = 1.0f;
-            if (intensity < 0.45f) intensity = 0.45f;
-        }
-        uint16_t shaded = shadeColor(color_to_use, intensity);
-        
-        if (f.num_vertices == 3) {
-            sprite.fillTriangle((int16_t)projected[i0].x, (int16_t)projected[i0].y,
-                                (int16_t)projected[i1].x, (int16_t)projected[i1].y,
-                                (int16_t)projected[i2].x, (int16_t)projected[i2].y,
-                                shaded);
-        } else if (f.num_vertices == 4) {
+
+        sprite.fillTriangle((int16_t)(projected[i0].x + 0.5f), (int16_t)(projected[i0].y + 0.5f),
+                            (int16_t)(projected[i1].x + 0.5f), (int16_t)(projected[i1].y + 0.5f),
+                            (int16_t)(projected[i2].x + 0.5f), (int16_t)(projected[i2].y + 0.5f),
+                            shaded);
+        if (f.num_vertices == 4) {
             int i3 = f.indices[3];
-            sprite.fillTriangle((int16_t)projected[i0].x, (int16_t)projected[i0].y,
-                                (int16_t)projected[i1].x, (int16_t)projected[i1].y,
-                                (int16_t)projected[i2].x, (int16_t)projected[i2].y,
-                                shaded);
-            sprite.fillTriangle((int16_t)projected[i0].x, (int16_t)projected[i0].y,
-                                (int16_t)projected[i2].x, (int16_t)projected[i2].y,
-                                (int16_t)projected[i3].x, (int16_t)projected[i3].y,
+            sprite.fillTriangle((int16_t)(projected[i0].x + 0.5f), (int16_t)(projected[i0].y + 0.5f),
+                                (int16_t)(projected[i2].x + 0.5f), (int16_t)(projected[i2].y + 0.5f),
+                                (int16_t)(projected[i3].x + 0.5f), (int16_t)(projected[i3].y + 0.5f),
                                 shaded);
         }
     }
@@ -1881,24 +1414,28 @@ void draw3DModel(const Point3D* vertices, int num_vertices, const Face* faces, i
 
 void drawCarRearGlass(float pos_x, float pos_y, float pos_z,
                       float rot_x, float rot_y, float rot_z,
-                      float scale) {
-    static const Point3D rear_glass[4] = {
+                      float scale, bool braking) {
+    // 4 glass corners, then 2 tail light positions.
+    static const Point3D rear_points[6] = {
         { -0.42f, 1.025f, -0.79f },
         {  0.42f, 1.025f, -0.79f },
         {  0.24f, 0.742f, -1.275f },
-        { -0.24f, 0.742f, -1.275f }
+        { -0.24f, 0.742f, -1.275f },
+        { -0.47f, 0.470f, -1.660f },
+        {  0.47f, 0.470f, -1.660f }
     };
-    
-    Point2D projected[4];
-    
-    float cx = cos(rot_x), sx = sin(rot_x);
-    float cy = cos(rot_y), sy = sin(rot_y);
-    float cz = cos(rot_z), sz = sin(rot_z);
-    
-    for (int i = 0; i < 4; i++) {
-        float lx = rear_glass[i].x * scale;
-        float ly = rear_glass[i].y * scale;
-        float lz = rear_glass[i].z * scale;
+
+    Point2D projected[6];
+    float depth[6];
+
+    float cx = cosf(rot_x), sx = sinf(rot_x);
+    float cy = cosf(rot_y), sy = sinf(rot_y);
+    float cz = cosf(rot_z), sz = sinf(rot_z);
+
+    for (int i = 0; i < 6; i++) {
+        float lx = rear_points[i].x * scale;
+        float ly = rear_points[i].y * scale;
+        float lz = rear_points[i].z * scale;
         
         float x1 = lx * cz - ly * sz;
         float y1 = lx * sz + ly * cz;
@@ -1925,10 +1462,11 @@ void drawCarRearGlass(float pos_x, float pos_y, float pos_z,
         float rz_cam = ry_cam1 * cam_sin_pitch + rz_cam1 * cam_cos_pitch;
         
         if (rz_cam <= 0.1f) return;
+        depth[i] = rz_cam;
         projected[i].x = center_x + (rx_cam * fov / rz_cam);
         projected[i].y = center_y - (ry_cam * fov / rz_cam);
     }
-    
+
     sprite.fillTriangle((int16_t)projected[0].x, (int16_t)projected[0].y,
                         (int16_t)projected[1].x, (int16_t)projected[1].y,
                         (int16_t)projected[2].x, (int16_t)projected[2].y,
@@ -1937,49 +1475,71 @@ void drawCarRearGlass(float pos_x, float pos_y, float pos_z,
                         (int16_t)projected[2].x, (int16_t)projected[2].y,
                         (int16_t)projected[3].x, (int16_t)projected[3].y,
                         0x0000);
-    
+
     sprite.drawLine((int16_t)projected[0].x, (int16_t)projected[0].y,
                     (int16_t)projected[1].x, (int16_t)projected[1].y, 0x39E7);
     sprite.drawLine((int16_t)projected[0].x, (int16_t)projected[0].y,
                     (int16_t)projected[3].x, (int16_t)projected[3].y, 0x2104);
     sprite.drawLine((int16_t)projected[1].x, (int16_t)projected[1].y,
                     (int16_t)projected[2].x, (int16_t)projected[2].y, 0x2104);
+
+    // Tail lights when the player brakes.
+    if (braking) {
+        for (int i = 4; i <= 5; i++) {
+            int r = (int)(0.075f * fov / depth[i]);
+            if (r < 1) r = 1;
+            if (r > 5) r = 5;
+            int x = (int)projected[i].x;
+            int y = (int)projected[i].y;
+            sprite.fillRect(x - r, y - r / 2 - 1, r * 2 + 1, r + 2, 0xF800);
+            sprite.fillRect(x - r / 2, y - 1, r + 1, 2, 0xFFE0);
+        }
+    }
 }
 
-void drawTreeImpostor(float pos_x, float pos_y, float pos_z, float scale) {
+void drawTreeImpostor(float pos_x, float pos_y, float pos_z, float scale, uint8_t fog_a) {
     float sx, sy, sz;
     projectPoint(pos_x, pos_y, pos_z, sx, sy, sz);
     if (sz <= 2.0f || sz > 44.0f) return;
-    
+
     int h = (int)(460.0f * scale / sz);
     if (h < 4) return;
     if (h > 48) h = 48;
-    
+
     int x = (int)sx;
     int y = (int)sy;
     int half_w = h / 4;
     if (x < -h || x > SCREEN_WIDTH + h || y < -h || y > SCREEN_HEIGHT + h) return;
-    
+
     int trunk_h = h / 3;
     int trunk_w = h / 10;
     if (trunk_w < 1) trunk_w = 1;
     int leaf_base_y = y - trunk_h;
     int top_y = y - h;
-    
-    sprite.fillRect(x - trunk_w / 2, leaf_base_y, trunk_w, trunk_h, 0x3920);
+
+    uint16_t trunk_color = 0x3920;
+    uint16_t leaf_dark = 0x0340;
+    uint16_t leaf_mid = 0x04C0;
+    if (fog_a) {
+        trunk_color = blend565(trunk_color, FOG_COLOR, fog_a);
+        leaf_dark = blend565(leaf_dark, FOG_COLOR, fog_a);
+        leaf_mid = blend565(leaf_mid, FOG_COLOR, fog_a);
+    }
+
+    sprite.fillRect(x - trunk_w / 2, leaf_base_y, trunk_w, trunk_h, trunk_color);
     sprite.fillTriangle(x - half_w, leaf_base_y,
                         x + half_w, leaf_base_y,
                         x, top_y,
-                        0x0340);
+                        leaf_dark);
     sprite.fillTriangle(x - half_w * 3 / 4, leaf_base_y - h / 4,
                         x + half_w * 3 / 4, leaf_base_y - h / 4,
                         x, top_y + h / 6,
-                        0x04C0);
+                        leaf_mid);
 }
 
 void drawOpponentBrakeLights(float pos_x, float pos_y, float pos_z, float yaw, bool braking) {
-    float cy = cos(yaw);
-    float sy = sin(yaw);
+    float cy = cosf(yaw);
+    float sy = sinf(yaw);
     
     float cam_dx = cam_x - pos_x;
     float cam_dz = cam_z - pos_z;
@@ -2017,15 +1577,15 @@ void drawOpponentBrakeLights(float pos_x, float pos_y, float pos_z, float yaw, b
 }
 
 // Billboard drawing
-void drawBillboard(float pos_x, float pos_y, float pos_z, float rot_y, float scale, uint16_t color) {
+void drawBillboard(float pos_x, float pos_y, float pos_z, float rot_y, float scale, uint16_t color, uint8_t fog_a) {
     // 1. Draw the board face
-    draw3DModel(billboard_vertices, 8, billboard_faces, BILLBOARD_NUM_FACES,
+    draw3DModel(billboard_vertices, 8, billboard_faces, billboard_normals, BILLBOARD_NUM_FACES,
                 pos_x, pos_y, pos_z,
                 0.0f, rot_y, 0.0f,
-                scale, color);
-                
+                scale, color, fog_a);
+
     // 2. Draw support posts as lines (simpler, faster)
-    float c_y = cos(rot_y), s_y = sin(rot_y);
+    float c_y = cosf(rot_y), s_y = sinf(rot_y);
     float lp0_x = -1.5f * scale * c_y + pos_x;
     float lp0_y = pos_y;
     float lp0_z = 1.5f * scale * s_y + pos_z;
@@ -2041,10 +1601,14 @@ void drawBillboard(float pos_x, float pos_y, float pos_z, float rot_y, float sca
     float rp1_z = -1.5f * scale * s_y + pos_z;
     
     float sx0, sy0, sz0, sx1, sy1, sz1;
-    if (projectPoint(lp0_x, lp0_y, lp0_z, sx0, sy0, sz0) && projectPoint(lp1_x, lp1_y, lp1_z, sx1, sy1, sz1)) {
+    projectPoint(lp0_x, lp0_y, lp0_z, sx0, sy0, sz0);
+    projectPoint(lp1_x, lp1_y, lp1_z, sx1, sy1, sz1);
+    if (sz0 > 0.4f && sz1 > 0.4f) {
         sprite.drawLine((int16_t)sx0, (int16_t)sy0, (int16_t)sx1, (int16_t)sy1, 0x4A69);
     }
-    if (projectPoint(rp0_x, rp0_y, rp0_z, sx0, sy0, sz0) && projectPoint(rp1_x, rp1_y, rp1_z, sx1, sy1, sz1)) {
+    projectPoint(rp0_x, rp0_y, rp0_z, sx0, sy0, sz0);
+    projectPoint(rp1_x, rp1_y, rp1_z, sx1, sy1, sz1);
+    if (sz0 > 0.4f && sz1 > 0.4f) {
         sprite.drawLine((int16_t)sx0, (int16_t)sy0, (int16_t)sx1, (int16_t)sy1, 0x4A69);
     }
     
@@ -2078,6 +1642,24 @@ bool projectPoint(float wx, float wy, float wz, float& sx, float& sy, float& sz)
     
     sx = center_x + (rx * fov / rz);
     sy = center_y - (ry * fov / rz);
+
+    // Radial clamp for far-stretched projections. The near-plane stretch
+    // trick above can fling coordinates to tens of thousands of pixels,
+    // which would overflow the rasterizer's int16 coordinates (wrapping into
+    // garbage triangles). Scaling the offset vector UNIFORMLY preserves the
+    // point's direction from the screen center exactly -- clamping x and y
+    // independently would bend edge slopes (visible as road edges kinking
+    // inward at the screen border).
+    float ox = sx - center_x;
+    float oy = sy - center_y;
+    float ax = fabsf(ox);
+    float ay = fabsf(oy);
+    float m = (ax > ay) ? ax : ay;
+    if (m > 2500.0f) {
+        float k = 2500.0f / m;
+        sx = center_x + ox * k;
+        sy = center_y + oy * k;
+    }
     return true;
 }
 
@@ -2093,7 +1675,7 @@ void getTrackPosition(float seg_float, float lateral_pos, float& out_x, float& o
     
     out_rx = track[seg].rx * (1.0f - frac) + track[next].rx * frac;
     out_rz = track[seg].rz * (1.0f - frac) + track[next].rz * frac;
-    float len = sqrt(out_rx*out_rx + out_rz*out_rz);
+    float len = sqrtf(out_rx*out_rx + out_rz*out_rz);
     out_rx /= len;
     out_rz /= len;
     
@@ -2117,10 +1699,10 @@ void cameraRelativeToWorld(float local_x, float local_y, float local_z, float& o
 }
 
 void updateCameraTrig() {
-    cam_cos_yaw = cos(cam_yaw);
-    cam_sin_yaw = sin(cam_yaw);
-    cam_cos_pitch = cos(cam_pitch);
-    cam_sin_pitch = sin(cam_pitch);
+    cam_cos_yaw = cosf(cam_yaw);
+    cam_sin_yaw = sinf(cam_yaw);
+    cam_cos_pitch = cosf(cam_pitch);
+    cam_sin_pitch = sinf(cam_pitch);
 }
 
 float stableJitter(int seg, int side, int index, int salt) {
@@ -2142,31 +1724,52 @@ float approachFloat(float current, float target, float response, float dt) {
     return current + (target - current) * blend;
 }
 
+// Per-scanline dithered vertical gradient written straight into the
+// framebuffer (sprite pixels are stored byte-swapped, hence the bswap).
+// Rows [y_start, y_end) take their blend position from (y - span_start) / span_len.
+void fillGradientRows(int y_start, int y_end, int span_start, int span_len,
+                      int r0, int g0, int b0, int r1, int g1, int b1) {
+    if (y_start < 0) y_start = 0;
+    if (y_end > SCREEN_HEIGHT) y_end = SCREEN_HEIGHT;
+    if (y_start >= y_end) return;
+    if (span_len < 1) span_len = 1;
+    uint16_t* buf = (uint16_t*)sprite.getBuffer();
+    float inv = 1.0f / (float)span_len;
+
+    for (int y = y_start; y < y_end; y++) {
+        float t = (float)(y - span_start) * inv;
+        if (t < 0.0f) t = 0.0f;
+        if (t > 1.0f) t = 1.0f;
+        int r = r0 + (int)((r1 - r0) * t);
+        int g = g0 + (int)((g1 - g0) * t);
+        int b = b0 + (int)((b1 - b0) * t);
+        // Two colors half a quantization step apart, alternated per pixel in a
+        // checker pattern: cheap ordered dithering that kills banding.
+        uint16_t ca = pack565(r, g, b);
+        int r2 = r + 4; if (r2 > 255) r2 = 255;
+        int g2 = g + 2; if (g2 > 255) g2 = 255;
+        int b2 = b + 4; if (b2 > 255) b2 = 255;
+        uint16_t cb = pack565(r2, g2, b2);
+        uint16_t sa = __builtin_bswap16(ca);
+        uint16_t sb = __builtin_bswap16(cb);
+        uint32_t pat = (y & 1) ? ((uint32_t)sa << 16) | sb : ((uint32_t)sb << 16) | sa;
+        uint32_t* row = (uint32_t*)(buf + y * SCREEN_WIDTH);
+        for (int x = 0; x < SCREEN_WIDTH / 2; x++) row[x] = pat;
+    }
+}
+
 // Render background (Gradient sky, sun, scrolling mountains, green grass)
 void drawBackground(int horizon_y, float yaw) {
     int sky_height = horizon_y;
     if (sky_height < 0) sky_height = 0;
     if (sky_height > SCREEN_HEIGHT) sky_height = SCREEN_HEIGHT;
-    
-    // Sky gradient bands
+
+    // Smooth dithered sky gradient: deep blue up high to pale haze at the
+    // horizon (which matches FOG_COLOR so the road fades seamlessly into it).
     if (sky_height > 0) {
-        int bands = 8;
-        int band_h = sky_height / bands;
-        if (band_h < 1) band_h = 1;
-        
-        for (int b = 0; b < bands; b++) {
-            float ratio = (float)b / (float)(bands - 1);
-            uint8_t r = (uint8_t)(4 + ratio * 10);
-            uint8_t g = (uint8_t)(28 + ratio * 24);
-            uint8_t b_val = (uint8_t)(31 - ratio * 2);
-            uint16_t sky_color = (r << 11) | (g << 5) | b_val;
-            
-            int y0 = b * band_h;
-            int h = (b == bands - 1) ? (sky_height - y0) : band_h;
-            if (h > 0) {
-                sprite.fillRect(0, y0, SCREEN_WIDTH, h, sky_color);
-            }
-        }
+        fillGradientRows(0, sky_height, 0, (horizon_y > 0 ? horizon_y : 1),
+                         10, 64, 200,
+                         172, 211, 235);
     }
     
     // Sun
@@ -2194,11 +1797,13 @@ void drawBackground(int horizon_y, float yaw) {
     // Mountains
     drawMountains(horizon_y, yaw);
     
-    // Grass
+    // Grass: hazy pale green at the horizon, deepening toward the foreground.
     int grass_y = horizon_y;
     if (grass_y < 0) grass_y = 0;
     if (grass_y < SCREEN_HEIGHT) {
-        sprite.fillRect(0, grass_y, SCREEN_WIDTH, SCREEN_HEIGHT - grass_y, 0x55E8);
+        fillGradientRows(grass_y, SCREEN_HEIGHT, grass_y, SCREEN_HEIGHT - grass_y,
+                         150, 188, 165,
+                         56, 134, 40);
     }
 }
 
@@ -2219,21 +1824,30 @@ void drawClouds(int horizon_y, float yaw) {
         {  0.33f, 36, 38, 9 }
     };
     
-    const float south_yaw = PI;
+    // Two cloud banks on opposite sides of the world. The second bank
+    // mirrors the offsets and tweaks sizes/heights so it reads as different
+    // weather rather than a copy of the first.
+    static const float bank_yaw[2] = { PI, 0.0f };
     const float visible_half_angle = 0.92f;
-    float wind = fmodf(millis() * 0.000035f, 0.28f);
-    
-    for (int i = 0; i < 3; i++) {
-        float cloud_yaw = south_yaw + clouds[i].yaw_offset + wind;
+    // Triangle-wave wind: clouds drift one way, ease to a stop, and drift
+    // back -- no teleport when the old sawtooth wrapped around.
+    float phase = fmodf(millis() * 0.000035f, 0.56f);
+    float wind = (phase < 0.28f) ? phase : (0.56f - phase);
+
+    for (int bi = 0; bi < 6; bi++) {
+        int b = bi / 3;
+        int i = bi % 3;
+        float yaw_off = b ? (-clouds[i].yaw_offset + 0.15f) : clouds[i].yaw_offset;
+        float cloud_yaw = bank_yaw[b] + yaw_off + wind;
         float delta = cloud_yaw - yaw;
         while (delta > PI) delta -= 2.0f * PI;
         while (delta < -PI) delta += 2.0f * PI;
         if (fabsf(delta) > visible_half_angle) continue;
-        
+
         int cx = 160 + (int)(delta * 185.0f);
-        int cy = horizon_y - clouds[i].y_offset;
-        int cw = clouds[i].w;
-        int ch = clouds[i].h;
+        int cy = horizon_y - clouds[i].y_offset + (b ? 7 : 0);
+        int cw = clouds[i].w - (b ? 7 : 0);
+        int ch = clouds[i].h - (b ? 2 : 0);
         
         if (cy < 8 || cy > horizon_y - 6) continue;
         if (cx + cw < 0 || cx - cw > SCREEN_WIDTH) continue;
@@ -2290,24 +1904,28 @@ void drawMountains(int horizon_y, float yaw) {
             int y2 = my;
             
             if (x2 >= 0 && x0 < 320) {
-                sprite.fillTriangle(x0, y0, x1, y1, x2, y2, mountains[i].color);
+                // Distant peaks sit in the haze layer.
+                uint16_t m_color = blend565(mountains[i].color, FOG_COLOR, 9);
+                uint16_t m_shadow = blend565(mountains[i].shadow, FOG_COLOR, 9);
+                sprite.fillTriangle(x0, y0, x1, y1, x2, y2, m_color);
                 if (i & 1) {
-                    sprite.fillTriangle(x0, y0, x1, y1, x1, y0, mountains[i].shadow);
+                    sprite.fillTriangle(x0, y0, x1, y1, x1, y0, m_shadow);
                 } else {
-                    sprite.fillTriangle(x1, y1, x2, y2, x1, y0, mountains[i].shadow);
+                    sprite.fillTriangle(x1, y1, x2, y2, x1, y0, m_shadow);
                 }
-                
+
                 // Snow caps
                 if (mountains[i].snow_style != 0) {
+                    uint16_t snow = blend565(0xFFFF, FOG_COLOR, 7);
                     int sx0 = x1 - (x1 - x0) * 0.35f;
                     int sy0 = y1 + mountains[i].h * 0.35f;
                     int sx2 = x1 + (x2 - x1) * 0.35f;
                     if (mountains[i].snow_style == 1) {
-                        sprite.fillTriangle(sx0, sy0, x1, y1, x1, sy0, 0xFFFF);
+                        sprite.fillTriangle(sx0, sy0, x1, y1, x1, sy0, snow);
                     } else if (mountains[i].snow_style == 2) {
-                        sprite.fillTriangle(x1, sy0, x1, y1, sx2, sy0, 0xFFFF);
+                        sprite.fillTriangle(x1, sy0, x1, y1, sx2, sy0, snow);
                     } else {
-                        sprite.fillTriangle(sx0, sy0, x1, y1, sx2, sy0, 0xFFFF);
+                        sprite.fillTriangle(sx0, sy0, x1, y1, sx2, sy0, snow);
                     }
                 }
             }
@@ -2325,20 +1943,83 @@ void drawQuad(float sx0, float sy0, float sx1, float sy1, float sx2, float sy2, 
                         (int16_t)sx3, (int16_t)sy3, color);
 }
 
-// Color Shading (0.0 to 1.0 multiplier)
-uint16_t shadeColor(uint16_t color, float intensity) {
-    if (intensity >= 1.0f) return color;
-    if (intensity <= 0.0f) return 0;
-    
-    uint16_t r = (color >> 11) & 0x1F;
-    uint16_t g = (color >> 5) & 0x3F;
-    uint16_t b = color & 0x1F;
-    
-    r = (uint16_t)(r * intensity);
-    g = (uint16_t)(g * intensity);
-    b = (uint16_t)(b * intensity);
-    
-    return (r << 11) | (g << 5) | b;
+// Translucent ground shadow: darkens the framebuffer pixels under an
+// ellipse instead of painting a solid blob, so road markings stay visible.
+void shadowEllipse(int cx, int cy, int rx, int ry, uint8_t darken) {
+    if (rx <= 0 || ry <= 0) return;
+    uint16_t* buf = (uint16_t*)sprite.getBuffer();
+    uint8_t keep = 32 - darken;
+    for (int dy = -ry; dy <= ry; dy++) {
+        int y = cy + dy;
+        if (y < 0 || y >= SCREEN_HEIGHT) continue;
+        float fy = (float)dy / (float)ry;
+        int span = (int)(rx * sqrtf(1.0f - fy * fy));
+        int x0 = cx - span; if (x0 < 0) x0 = 0;
+        int x1 = cx + span; if (x1 >= SCREEN_WIDTH) x1 = SCREEN_WIDTH - 1;
+        uint16_t* p = buf + y * SCREEN_WIDTH + x0;
+        for (int x = x0; x <= x1; x++, p++) {
+            uint16_t c = __builtin_bswap16(*p);
+            *p = __builtin_bswap16(shade565(c, keep));
+        }
+    }
+}
+
+// Screen-space particles (dirt, sparks)
+void spawnParticle(float x, float y, float vx, float vy, int life, uint16_t color) {
+    particles[particle_cursor] = { x, y, vx, vy, (int16_t)life, color };
+    particle_cursor = (particle_cursor + 1) % MAX_PARTICLES;
+}
+
+void spawnImpactSparks(int cx, int cy, float dir) {
+    for (int i = 0; i < 8; i++) {
+        uint16_t c = (i & 1) ? 0xFFE0 : ((i & 2) ? 0xFD20 : 0xFFFF);
+        spawnParticle(cx + random(-6, 7), cy + random(-8, 9),
+                      dir * (0.8f + random(0, 21) * 0.1f), -random(0, 25) * 0.1f,
+                      8 + random(0, 9), c);
+    }
+}
+
+void updateAndDrawParticles() {
+    for (int i = 0; i < MAX_PARTICLES; i++) {
+        Particle& p = particles[i];
+        if (p.life <= 0) continue;
+        p.life--;
+        p.x += p.vx;
+        p.y += p.vy;
+        p.vy += 0.18f; // gravity
+        int size = (p.life > 8) ? 2 : 1;
+        sprite.fillRect((int)p.x, (int)p.y, size, size, p.color);
+    }
+}
+
+// Fit the real track outline into a small box at the top center of the HUD.
+void buildMinimap() {
+    float minx = 1e9f, maxx = -1e9f, minz = 1e9f, maxz = -1e9f;
+    for (int i = 0; i < NUM_SEGMENTS; i++) {
+        if (track[i].x < minx) minx = track[i].x;
+        if (track[i].x > maxx) maxx = track[i].x;
+        if (track[i].z < minz) minz = track[i].z;
+        if (track[i].z > maxz) maxz = track[i].z;
+    }
+    float cx = (minx + maxx) * 0.5f;
+    float cz = (minz + maxz) * 0.5f;
+    float sx = 68.0f / (maxx - minx);
+    float sz = 40.0f / (maxz - minz);
+    float s = (sx < sz) ? sx : sz;
+    for (int p = 0; p < MINIMAP_POINTS; p++) {
+        int seg = p * (NUM_SEGMENTS / MINIMAP_POINTS);
+        mm_px[p] = (int16_t)(275.0f + (track[seg].x - cx) * s); // top-right corner
+        mm_py[p] = (int16_t)(27.0f - (track[seg].z - cz) * s);
+    }
+}
+
+void buildFogTable() {
+    for (int i = 0; i <= ROAD_DRAW_SEGMENTS + 1; i++) {
+        float t = (float)(i - FOG_START_SEGMENT) / (float)(ROAD_DRAW_SEGMENTS - FOG_START_SEGMENT);
+        if (t < 0.0f) t = 0.0f;
+        if (t > 1.0f) t = 1.0f;
+        fog_table[i] = (uint8_t)(t * t * 30.0f);
+    }
 }
 
 // UI Head-Up Display Overlay
@@ -2370,27 +2051,23 @@ void drawHUD() {
     
     // Position ranking
     float player_dist = player_segment_float + player_laps * NUM_SEGMENTS;
-    float opp1_dist = opponents[0].segment + opponents[0].laps * NUM_SEGMENTS;
-    float opp2_dist = opponents[1].segment + opponents[1].laps * NUM_SEGMENTS;
-    
+
     int rank = 1;
-    if (opp1_dist > player_dist) rank++;
-    if (opp2_dist > player_dist) rank++;
+    for (int i = 0; i < NUM_OPPONENTS; i++) {
+        float opp_dist = opponents[i].segment + opponents[i].laps * NUM_SEGMENTS;
+        if (opp_dist > player_dist) rank++;
+    }
     
-    sprite.setTextDatum(TR_DATUM);
-    sprite.setTextSize(2);
+    // One-line position readout under LAP and TIME
+    sprite.setTextSize(1);
     sprite.setTextColor(0xFCE0); // Gold
     const char* pos_suffix = "th";
     if (rank == 1) pos_suffix = "st";
     else if (rank == 2) pos_suffix = "nd";
     else if (rank == 3) pos_suffix = "rd";
-    char rank_str[5];
-    snprintf(rank_str, sizeof(rank_str), "%d%s", rank, pos_suffix);
-    sprite.drawString(rank_str, 310, 8);
-    
-    sprite.setTextSize(1);
-    sprite.setTextColor(0xFFFF);
-    sprite.drawString("POS", 310, 26);
+    char rank_str[10];
+    snprintf(rank_str, sizeof(rank_str), "POS %d%s", rank, pos_suffix);
+    sprite.drawString(rank_str, 10, 32);
     
     // Speedometer
     sprite.setTextDatum(BR_DATUM);
@@ -2428,32 +2105,44 @@ void drawHUD() {
         sprite.drawFastVLine(tx, tach_y + 2, tach_h - 4, 0x3186);
     }
     
-    // Track Minimap Progress Bar
-    int map_x = 90;
-    int map_y = 8;
-    int map_w = 140;
-    sprite.drawFastHLine(map_x, map_y, map_w, 0x5AEB);
-    sprite.drawFastVLine(map_x, map_y - 2, 5, 0xFFFF);
-    sprite.drawFastVLine(map_x + map_w, map_y - 2, 5, 0xFFFF);
-    
-    // Draw opponent dots
-    for (int i = 0; i < 2; i++) {
-        float opp_ratio = opponents[i].segment / NUM_SEGMENTS;
-        int opp_dot_x = map_x + (int)(opp_ratio * map_w);
-        sprite.fillCircle(opp_dot_x, map_y, 2, opponents[i].color);
+    // True track-shape minimap with live car positions
+    for (int p = 0; p < MINIMAP_POINTS; p++) {
+        int q = (p + 1) % MINIMAP_POINTS;
+        sprite.drawLine(mm_px[p], mm_py[p], mm_px[q], mm_py[q], 0x39E7);
     }
-    // Draw player dot
-    float p_ratio = player_segment_float / NUM_SEGMENTS;
-    int p_dot_x = map_x + (int)(p_ratio * map_w);
-    sprite.fillCircle(p_dot_x, map_y, 3, 0xF800);
+    sprite.fillRect(mm_px[0] - 1, mm_py[0] - 1, 3, 3, 0xFFFF); // start/finish
+    int seg_per_point = NUM_SEGMENTS / MINIMAP_POINTS;
+    for (int i = 0; i < NUM_OPPONENTS; i++) {
+        int p = ((int)opponents[i].segment / seg_per_point) % MINIMAP_POINTS;
+        sprite.fillCircle(mm_px[p], mm_py[p], 1, opponents[i].color);
+    }
+    int pp = ((int)player_segment_float / seg_per_point) % MINIMAP_POINTS;
+    sprite.fillCircle(mm_px[pp], mm_py[pp], 2, 0xF800);
     
-    sprite.setTextDatum(BL_DATUM);
-    sprite.setTextSize(1);
-    sprite.setTextColor(0x07E0);
-    char fps_str[14];
-    int fps10 = (int)(measured_fps * 10.0f + 0.5f);
-    snprintf(fps_str, sizeof(fps_str), "FPS:%d.%d", fps10 / 10, fps10 % 10);
-    sprite.drawString(fps_str, 10, 166);
+    // Performance readout, configured in User Config at the top of the file.
+    // Render ms = CPU time per frame before the push; " SB" marks the
+    // single-buffer fallback (no DMA) -- both useful when diagnosing.
+    if (SHOW_FPS || SHOW_FRAME_TIMING) {
+        sprite.setTextDatum(BL_DATUM);
+        sprite.setTextSize(1);
+        sprite.setTextColor(0x07E0);
+        char perf_str[24];
+        int len = 0;
+        if (SHOW_FPS) {
+            int fps10 = (int)(measured_fps * 10.0f + 0.5f);
+            len += snprintf(perf_str + len, sizeof(perf_str) - len,
+                            "FPS:%d.%d", fps10 / 10, fps10 % 10);
+        }
+        if (SHOW_FRAME_TIMING) {
+            int r10 = (int)(perf_render_ms * 10.0f + 0.5f);
+            len += snprintf(perf_str + len, sizeof(perf_str) - len,
+                            "%s%d.%dms", len ? " " : "", r10 / 10, r10 % 10);
+        }
+        if (!use_dma) {
+            snprintf(perf_str + len, sizeof(perf_str) - len, " SB");
+        }
+        sprite.drawString(perf_str, 10, 166);
+    }
 }
 
 // Countdown overlay
@@ -2486,9 +2175,25 @@ void drawFinished() {
     sprite.setTextDatum(MC_DATUM);
     sprite.setTextSize(3);
     sprite.setTextColor(0xFCE0); // gold
-    sprite.drawString("FINISHED!", 160, 50);
-    
+    sprite.drawString("FINISHED!", 160, 46);
+
+    // Final race position. Opponents freeze the moment the player finishes
+    // (their AI only runs in PLAYING), so this stays stable on screen.
+    float player_dist = player_segment_float + player_laps * NUM_SEGMENTS;
+    int rank = 1;
+    for (int i = 0; i < NUM_OPPONENTS; i++) {
+        if (opponents[i].segment + opponents[i].laps * NUM_SEGMENTS > player_dist) rank++;
+    }
+    const char* pos_suffix = "th";
+    if (rank == 1) pos_suffix = "st";
+    else if (rank == 2) pos_suffix = "nd";
+    else if (rank == 3) pos_suffix = "rd";
+    char pos_str[24];
+    snprintf(pos_str, sizeof(pos_str), "RACE POSITION: %d%s", rank, pos_suffix);
     sprite.setTextSize(1);
+    sprite.setTextColor(0xFCE0);
+    sprite.drawString(pos_str, 160, 64);
+
     sprite.setTextColor(0xFFFF);
     
     int mins = race_finish_ms / 60000;
@@ -2547,20 +2252,21 @@ void drawStartScreen() {
     // Render slowly rotating car body
     float rot_y = t * 0.72f;
     float car_x_val = 0.0f;
-    float car_y_val = 0.16f + 0.025f * sin(t * 2.7f);
+    float car_y_val = 0.16f + 0.025f * sinf(t * 2.7f);
     float car_z_val = 4.15f;
-    
-    cam_light_x = 0.18f + 0.18f * sin(t * 0.8f);
-    cam_light_y = 0.98f;
-    cam_light_z = -0.18f;
-    
-    draw3DModel(car_vertices, CAR_NUM_VERTICES, car_faces, CAR_NUM_FACES,
+
+    // Animated showroom light, in world space.
+    g_light_x = 0.18f + 0.18f * sinf(t * 0.8f);
+    g_light_y = 0.98f;
+    g_light_z = -0.18f;
+
+    draw3DModel(car_vertices, CAR_NUM_VERTICES, car_faces, car_normals, CAR_NUM_FACES,
                 car_x_val, car_y_val, car_z_val,
-                0.0f, rot_y, 0.026f * sin(t * 1.55f),
-                1.22f, 0x021F); // Subaru blue
+                0.0f, rot_y, 0.026f * sinf(t * 1.55f),
+                1.22f, 0x021F, 0); // Subaru blue
     drawCarRearGlass(car_x_val, car_y_val, car_z_val,
-                     0.0f, rot_y, 0.026f * sin(t * 1.55f),
-                     1.22f);
+                     0.0f, rot_y, 0.026f * sinf(t * 1.55f),
+                     1.22f, false);
                 
     // UI titles
     sprite.setTextDatum(MC_DATUM);
@@ -2693,7 +2399,7 @@ void drawMenuGarage(float t) {
     drawMenuEllipse(160, 126, 108, 18, 0x39E7);
     drawMenuEllipse(160, 124, 76, 10, 0x18E3);
     
-    int sweep = (int)(sin(t * 1.55f) * 42.0f);
+    int sweep = (int)(sinf(t * 1.55f) * 42.0f);
     sprite.drawFastHLine(104 + sweep, 116, 50, 0x4A9F);
     sprite.drawFastHLine(174 - sweep, 135, 44, 0x8C51);
     sprite.drawFastHLine(110, 141, 100, 0x632C);
@@ -2765,3 +2471,1185 @@ void drawMenuShadow(int cx, int cy, int w, int h) {
         sprite.drawFastHLine(cx - span / 2, cy + y, span, color);
     }
 }
+
+// ===== GENERATED MODEL DATA (tools/gen_models.py) -- do not hand-edit =====
+const Point3D car_vertices[215] = {
+    {  0.5200f,  0.3950f, -0.7610f },
+    {  0.5200f,  0.2180f, -0.7290f },
+    {  0.5200f,  0.0620f, -0.8190f },
+    {  0.5200f,  0.0000f, -0.9880f },
+    {  0.5200f,  0.0610f, -1.1570f },
+    {  0.5200f,  0.2170f, -1.2480f },
+    {  0.5200f,  0.3950f, -1.2170f },
+    {  0.5200f,  0.5100f, -1.0790f },
+    {  0.5200f,  0.5110f, -0.8990f },
+    {  0.7060f,  0.3950f, -0.7610f },
+    {  0.7060f,  0.2180f, -0.7290f },
+    {  0.7060f,  0.0620f, -0.8190f },
+    {  0.7060f,  0.0000f, -0.9880f },
+    {  0.7060f,  0.0610f, -1.1570f },
+    {  0.7060f,  0.2170f, -1.2480f },
+    {  0.7060f,  0.3950f, -1.2170f },
+    {  0.7060f,  0.5100f, -1.0790f },
+    {  0.7060f,  0.5110f, -0.8990f },
+    { -0.8140f,  0.6580f,  0.5360f },
+    { -0.8010f,  0.7260f,  0.5360f },
+    { -0.8010f,  0.7260f,  0.4730f },
+    { -0.8140f,  0.6480f,  0.4730f },
+    { -0.6130f,  0.6580f,  0.5360f },
+    { -0.6090f,  0.6480f,  0.4730f },
+    { -0.5940f,  0.7130f,  0.4730f },
+    { -0.5960f,  0.7120f,  0.5360f },
+    { -0.6180f,  0.7090f, -1.1400f },
+    { -0.6260f,  0.6410f, -0.6420f },
+    { -0.6350f,  0.6380f,  0.6660f },
+    { -0.4340f,  1.0200f,  0.0170f },
+    { -0.6040f,  0.3160f,  1.6020f },
+    { -0.7010f,  0.4010f,  1.2510f },
+    { -0.6890f,  0.3170f,  1.2960f },
+    { -0.5950f,  0.0750f,  1.5970f },
+    { -0.5440f,  0.3830f,  1.5540f },
+    { -0.5310f,  0.4900f,  1.5320f },
+    { -0.6720f,  0.1070f, -1.2940f },
+    { -0.5830f,  0.1050f, -1.6090f },
+    { -0.5940f,  0.4300f, -1.6200f },
+    { -0.6720f,  0.0920f,  0.7170f },
+    { -0.6770f,  0.0830f, -0.7080f },
+    { -0.5470f,  0.6140f, -1.6180f },
+    { -0.5910f,  0.7280f, -1.3140f },
+    { -0.2000f,  0.7320f, -1.2950f },
+    { -0.4710f,  0.7280f, -1.3130f },
+    { -0.5060f,  0.7280f, -1.5820f },
+    { -0.4710f,  0.7280f, -1.5930f },
+    { -0.7030f,  0.4470f,  1.2160f },
+    { -0.6770f,  0.6150f, -1.1390f },
+    { -0.6950f,  0.5890f, -0.6570f },
+    { -0.5540f,  0.5920f,  1.3660f },
+    { -0.7030f,  0.5280f,  1.0960f },
+    { -0.6690f,  0.0790f,  1.3070f },
+    { -0.7070f,  0.3270f, -0.7090f },
+    { -0.7010f,  0.3170f,  0.7120f },
+    { -0.6840f,  0.5710f,  0.7110f },
+    { -0.7120f,  0.4550f, -0.7740f },
+    { -0.7030f,  0.4470f,  0.7790f },
+    { -0.7030f,  0.5280f,  0.9210f },
+    { -0.7060f,  0.4670f, -1.1990f },
+    { -0.7120f,  0.5340f, -1.0390f },
+    { -0.7150f,  0.5340f, -0.9200f },
+    { -0.7060f,  0.3270f, -1.2710f },
+    { -0.5170f,  0.8760f, -1.4510f },
+    { -0.5060f,  0.8770f, -1.6390f },
+    { -0.4690f,  0.8390f, -1.4170f },
+    { -0.4700f,  0.8390f, -1.6310f },
+    { -0.0010f,  0.3830f,  1.6660f },
+    { -0.0010f,  0.4930f,  1.6420f },
+    { -0.0010f,  0.1050f, -1.6910f },
+    { -0.0010f,  0.4280f, -1.7250f },
+    { -0.0010f,  0.6160f, -1.6570f },
+    { -0.0010f,  0.7340f, -1.6110f },
+    {  0.8140f,  0.6720f,  0.5360f },
+    {  0.8140f,  0.6630f,  0.4730f },
+    {  0.8010f,  0.7400f,  0.4730f },
+    {  0.8010f,  0.7400f,  0.5360f },
+    {  0.6120f,  0.6720f,  0.5360f },
+    {  0.6200f,  0.6630f,  0.4730f },
+    {  0.5900f,  0.7260f,  0.4650f },
+    {  0.5890f,  0.7270f,  0.5290f },
+    {  0.1990f,  0.7320f, -1.2950f },
+    {  0.4520f,  1.0350f, -0.7560f },
+    {  0.6210f,  0.7090f, -1.1400f },
+    {  0.6240f,  0.6410f, -0.6420f },
+    {  0.4400f,  1.0200f,  0.0170f },
+    {  0.6340f,  0.6380f,  0.6660f },
+    {  0.6030f,  0.3160f,  1.6020f },
+    {  0.6870f,  0.3170f,  1.2960f },
+    {  0.6990f,  0.4010f,  1.2510f },
+    {  0.5930f,  0.0750f,  1.5970f },
+    { -0.0010f,  0.3170f,  1.7060f },
+    { -0.0010f,  0.0740f,  1.7250f },
+    {  0.5420f,  0.3830f,  1.5540f },
+    {  0.5300f,  0.4900f,  1.5320f },
+    {  0.6700f,  0.1070f, -1.2940f },
+    {  0.5830f,  0.1050f, -1.6090f },
+    { -0.0010f,  0.4290f, -1.6490f },
+    {  0.5890f,  0.4350f, -1.6050f },
+    {  0.6700f,  0.0920f,  0.7170f },
+    {  0.6750f,  0.0830f, -0.7080f },
+    {  0.5460f,  0.6140f, -1.6180f },
+    {  0.5710f,  0.7280f, -1.3140f },
+    {  0.4690f,  0.7280f, -1.3130f },
+    {  0.4690f,  0.7280f, -1.5930f },
+    {  0.5040f,  0.7280f, -1.5820f },
+    {  0.7010f,  0.4470f,  1.2160f },
+    {  0.6930f,  0.5890f, -0.6570f },
+    {  0.6750f,  0.6150f, -1.1390f },
+    {  0.5520f,  0.5920f,  1.3660f },
+    {  0.7010f,  0.5280f,  1.0960f },
+    {  0.6680f,  0.0790f,  1.3070f },
+    {  0.7050f,  0.3270f, -0.7090f },
+    {  0.6990f,  0.3170f,  0.7120f },
+    {  0.6820f,  0.5710f,  0.7110f },
+    {  0.7100f,  0.4550f, -0.7740f },
+    {  0.7010f,  0.5280f,  0.9210f },
+    {  0.7010f,  0.4470f,  0.7790f },
+    {  0.7040f,  0.4670f, -1.1990f },
+    {  0.7130f,  0.5340f, -0.9200f },
+    {  0.7100f,  0.5340f, -1.0390f },
+    {  0.7040f,  0.3270f, -1.2710f },
+    {  0.5040f,  0.8770f, -1.6390f },
+    {  0.5160f,  0.8760f, -1.4510f },
+    {  0.4680f,  0.8390f, -1.4170f },
+    {  0.4680f,  0.8390f, -1.6310f },
+    { -0.4570f,  1.0070f,  0.1350f },
+    {  0.4550f,  1.0070f,  0.1350f },
+    { -0.4400f,  1.0490f, -0.7030f },
+    { -0.4540f,  1.0350f, -0.7560f },
+    {  0.4460f,  1.0490f, -0.7030f },
+    { -0.0010f,  0.6660f,  0.7980f },
+    {  0.5370f,  0.7280f, -1.5730f },
+    {  0.6000f,  0.6140f, -1.5650f },
+    {  0.6370f,  0.4320f, -1.5610f },
+    {  0.6300f,  0.1060f, -1.5650f },
+    { -0.5070f,  0.7280f, -1.5680f },
+    { -0.5990f,  0.6140f, -1.5660f },
+    { -0.6370f,  0.4330f, -1.5640f },
+    { -0.6300f,  0.1060f, -1.5620f },
+    {  0.4320f,  0.0920f,  0.7170f },
+    {  0.4320f,  0.0790f,  1.3070f },
+    { -0.4650f,  0.0920f,  0.7170f },
+    { -0.4660f,  0.0790f,  1.3070f },
+    {  0.4510f,  0.1070f, -1.2940f },
+    {  0.4530f,  0.0830f, -0.7080f },
+    { -0.4760f,  0.1070f, -1.2940f },
+    { -0.4770f,  0.0830f, -0.7080f },
+    {  0.3130f,  0.3160f,  1.6700f },
+    {  0.3130f,  0.0750f,  1.6820f },
+    {  0.3130f,  0.3830f,  1.6120f },
+    {  0.3130f,  0.4910f,  1.5880f },
+    { -0.2850f,  0.0750f,  1.6780f },
+    { -0.2850f,  0.3100f,  1.6650f },
+    { -0.2850f,  0.3830f,  1.6090f },
+    { -0.2850f,  0.4910f,  1.5850f },
+    { -0.2850f,  0.1050f, -1.6820f },
+    { -0.2850f,  0.4280f, -1.7210f },
+    {  0.2950f,  0.1050f, -1.6800f },
+    {  0.2950f,  0.4330f, -1.7130f },
+    { -0.0010f,  0.5930f,  1.3720f },
+    {  0.5090f,  0.3950f,  1.2370f },
+    {  0.5090f,  0.2180f,  1.2690f },
+    {  0.5090f,  0.0620f,  1.1790f },
+    {  0.5090f,  0.0000f,  1.0100f },
+    {  0.5090f,  0.0610f,  0.8400f },
+    {  0.5090f,  0.2170f,  0.7500f },
+    {  0.5090f,  0.3950f,  0.7810f },
+    {  0.5090f,  0.5100f,  0.9190f },
+    {  0.5090f,  0.5110f,  1.0990f },
+    {  0.6950f,  0.3950f,  1.2370f },
+    {  0.6950f,  0.2180f,  1.2690f },
+    {  0.6950f,  0.0620f,  1.1790f },
+    {  0.6950f,  0.0000f,  1.0100f },
+    {  0.6950f,  0.0610f,  0.8400f },
+    {  0.6950f,  0.2170f,  0.7500f },
+    {  0.6950f,  0.3950f,  0.7810f },
+    {  0.6950f,  0.5100f,  0.9190f },
+    {  0.6950f,  0.5110f,  1.0990f },
+    { -0.5090f,  0.3950f,  1.2370f },
+    { -0.5090f,  0.2180f,  1.2690f },
+    { -0.5090f,  0.0620f,  1.1790f },
+    { -0.5090f,  0.0000f,  1.0100f },
+    { -0.5090f,  0.0610f,  0.8400f },
+    { -0.5090f,  0.2170f,  0.7500f },
+    { -0.5090f,  0.3950f,  0.7810f },
+    { -0.5090f,  0.5100f,  0.9190f },
+    { -0.5090f,  0.5110f,  1.0990f },
+    { -0.6950f,  0.3950f,  1.2370f },
+    { -0.6950f,  0.2180f,  1.2690f },
+    { -0.6950f,  0.0620f,  1.1790f },
+    { -0.6950f,  0.0000f,  1.0100f },
+    { -0.6950f,  0.0610f,  0.8400f },
+    { -0.6950f,  0.2170f,  0.7500f },
+    { -0.6950f,  0.3950f,  0.7810f },
+    { -0.6950f,  0.5100f,  0.9190f },
+    { -0.6950f,  0.5110f,  1.0990f },
+    { -0.5180f,  0.3950f, -0.7610f },
+    { -0.5180f,  0.2180f, -0.7290f },
+    { -0.5180f,  0.0620f, -0.8190f },
+    { -0.5180f,  0.0000f, -0.9880f },
+    { -0.5180f,  0.0610f, -1.1570f },
+    { -0.5180f,  0.2170f, -1.2480f },
+    { -0.5180f,  0.3950f, -1.2170f },
+    { -0.5180f,  0.5100f, -1.0790f },
+    { -0.5180f,  0.5110f, -0.8990f },
+    { -0.7040f,  0.3950f, -0.7610f },
+    { -0.7040f,  0.2180f, -0.7290f },
+    { -0.7040f,  0.0620f, -0.8190f },
+    { -0.7040f,  0.0000f, -0.9880f },
+    { -0.7040f,  0.0610f, -1.1570f },
+    { -0.7040f,  0.2170f, -1.2480f },
+    { -0.7040f,  0.3950f, -1.2170f },
+    { -0.7040f,  0.5100f, -1.0790f },
+    { -0.7040f,  0.5110f, -0.8990f }
+};
+
+const Face car_faces[368] = {
+    { {  3, 12, 11,  0}, 3, 0, 0x0000 },
+    { { 11,  2,  3,  0}, 3, 0, 0x0000 },
+    { {  5, 14, 13,  0}, 3, 0, 0x0000 },
+    { { 13,  4,  5,  0}, 3, 0, 0x0000 },
+    { {  7, 16, 15,  0}, 3, 0, 0x0000 },
+    { { 15,  6,  7,  0}, 3, 0, 0x0000 },
+    { {  8, 17, 16,  0}, 3, 0, 0x0000 },
+    { { 16,  7,  8,  0}, 3, 0, 0x0000 },
+    { {  0,  9, 17,  0}, 3, 0, 0x0000 },
+    { { 17,  8,  0,  0}, 3, 0, 0x0000 },
+    { {  2,  1,  0,  0}, 3, 0, 0x0000 },
+    { {  0,  3,  2,  0}, 3, 0, 0x0000 },
+    { {  3,  0,  8,  0}, 3, 0, 0x0000 },
+    { {  8,  4,  3,  0}, 3, 0, 0x0000 },
+    { {  4,  8,  7,  0}, 3, 0, 0x0000 },
+    { {  7,  5,  4,  0}, 3, 0, 0x0000 },
+    { {  6,  5,  7,  0}, 3, 0, 0x0000 },
+    { {  9,  0,  1,  0}, 3, 0, 0x0000 },
+    { {  1, 10,  9,  0}, 3, 0, 0x0000 },
+    { { 10,  1,  2,  0}, 3, 0, 0x0000 },
+    { {  2, 11, 10,  0}, 3, 0, 0x0000 },
+    { { 12,  3,  4,  0}, 3, 0, 0x0000 },
+    { {  4, 13, 12,  0}, 3, 0, 0x0000 },
+    { { 14,  5,  6,  0}, 3, 0, 0x0000 },
+    { {  6, 15, 14,  0}, 3, 0, 0x0000 },
+    { { 11, 12,  9,  0}, 3, 0, 0x0000 },
+    { {  9, 10, 11,  0}, 3, 0, 0x0000 },
+    { { 12, 13, 17,  0}, 3, 0, 0x0000 },
+    { { 17,  9, 12,  0}, 3, 0, 0x0000 },
+    { { 13, 14, 16,  0}, 3, 0, 0x0000 },
+    { { 16, 17, 13,  0}, 3, 0, 0x0000 },
+    { { 15, 16, 14,  0}, 3, 0, 0x0000 },
+    { { 18, 20, 21,  0}, 3, 0, 0x0008 },
+    { { 20, 18, 19,  0}, 3, 0, 0x0008 },
+    { { 22, 21, 23,  0}, 3, 0, 0x0008 },
+    { { 21, 22, 18,  0}, 3, 0, 0x0008 },
+    { { 23, 20, 24,  0}, 3, 0, 0x0008 },
+    { { 20, 23, 21,  0}, 3, 0, 0x0008 },
+    { { 24, 19, 25,  0}, 3, 0, 0x0008 },
+    { { 19, 24, 20,  0}, 3, 0, 0x0008 },
+    { { 25, 18, 22,  0}, 3, 0, 0x0008 },
+    { { 18, 25, 19,  0}, 3, 0, 0x0008 },
+    { { 43, 26,129,  0}, 3, 0, 0xFFFF },
+    { { 27,128,129,  0}, 3, 0, 0x0008 },
+    { {128,126, 29,  0}, 3, 0, 0xFFFF },
+    { { 27,126,128,  0}, 3, 0, 0x0008 },
+    { { 27, 28,126,  0}, 3, 0, 0x0008 },
+    { { 30, 31, 32,  0}, 3, 1, 0xFFFF },
+    { { 33,153, 30,  0}, 3, 1, 0xFFFF },
+    { {153, 33,152,  0}, 3, 1, 0xFFFF },
+    { { 34,153,154,  0}, 3, 1, 0xFFFF },
+    { {153, 34, 30,  0}, 3, 1, 0xFFFF },
+    { { 35,154,155,  0}, 3, 1, 0xFFFF },
+    { {154, 35, 34,  0}, 3, 1, 0xFFFF },
+    { {135,158, 96,  0}, 3, 1, 0xFFFF },
+    { {135, 69,158,  0}, 3, 1, 0xFFFF },
+    { { 95, 69,135,  0}, 3, 1, 0xFFFF },
+    { { 95,156, 69,  0}, 3, 1, 0xFFFF },
+    { { 95, 37,156,  0}, 3, 1, 0xFFFF },
+    { { 95,139, 37,  0}, 3, 1, 0xFFFF },
+    { {144,139, 95,  0}, 3, 1, 0xFFFF },
+    { {146,139,144,  0}, 3, 1, 0xFFFF },
+    { { 36,139,146,  0}, 3, 1, 0xFFFF },
+    { {157, 97, 70,  0}, 3, 0, 0xFFFF },
+    { { 97,157, 38,  0}, 3, 0, 0xFFFF },
+    { { 37,157,156,  0}, 3, 1, 0xFFFF },
+    { {157, 37, 38,  0}, 3, 1, 0xFFFF },
+    { { 38, 71, 97,  0}, 3, 1, 0xFFFF },
+    { { 71, 38, 41,  0}, 3, 1, 0xFFFF },
+    { { 42, 43, 44,  0}, 3, 0, 0xFFFF },
+    { { 43, 42, 26,  0}, 3, 0, 0xFFFF },
+    { { 71, 46, 72,  0}, 3, 0, 0xFFFF },
+    { { 41, 46, 71,  0}, 3, 0, 0xFFFF },
+    { { 41, 45, 46,  0}, 3, 0, 0xFFFF },
+    { { 30, 47, 31,  0}, 3, 1, 0xFFFF },
+    { { 47, 30, 34,  0}, 3, 1, 0xFFFF },
+    { { 48, 27, 26,  0}, 3, 0, 0xFFFF },
+    { { 27, 48, 49,  0}, 3, 0, 0x0008 },
+    { { 50, 68,160,  0}, 3, 0, 0xFFFF },
+    { { 50,155, 68,  0}, 3, 1, 0xFFFF },
+    { { 50, 35,155,  0}, 3, 1, 0xFFFF },
+    { { 35, 47, 34,  0}, 3, 1, 0xFFFF },
+    { { 47, 35, 51,  0}, 3, 1, 0xFFFF },
+    { { 50, 51, 35,  0}, 3, 1, 0xFFFF },
+    { { 51, 50, 28,  0}, 3, 0, 0x0008 },
+    { { 52, 30, 32,  0}, 3, 1, 0xFFFF },
+    { { 30, 52, 33,  0}, 3, 1, 0xFFFF },
+    { { 53, 39, 54,  0}, 3, 1, 0xFFFF },
+    { { 39, 53, 40,  0}, 3, 1, 0xFFFF },
+    { { 28, 49, 55,  0}, 3, 0, 0x0008 },
+    { { 49, 28, 27,  0}, 3, 0, 0x0008 },
+    { { 41,136, 45,  0}, 3, 0, 0xFFFF },
+    { {136, 41,137,  0}, 3, 0, 0xFFFF },
+    { {129, 26, 27,  0}, 3, 0, 0x0008 },
+    { { 56, 53, 49,  0}, 3, 1, 0xFFFF },
+    { { 53, 55, 49,  0}, 3, 1, 0xFFFF },
+    { { 55, 53, 54,  0}, 3, 1, 0xFFFF },
+    { { 57, 55, 54,  0}, 3, 1, 0xFFFF },
+    { { 55, 57, 58,  0}, 3, 1, 0xFFFF },
+    { { 28, 58, 51,  0}, 3, 0, 0x0008 },
+    { { 58, 28, 55,  0}, 3, 0, 0x0008 },
+    { { 49, 61, 56,  0}, 3, 1, 0xFFFF },
+    { { 61, 49, 60,  0}, 3, 0, 0xFFFF },
+    { { 38,137, 41,  0}, 3, 1, 0xFFFF },
+    { {137, 38,138,  0}, 3, 1, 0xFFFF },
+    { { 45, 63, 64,  0}, 3, 0, 0xFFFF },
+    { { 63,136, 42,  0}, 3, 0, 0xFFFF },
+    { { 45,136, 63,  0}, 3, 0, 0xFFFF },
+    { {102,124,103,  0}, 3, 0, 0xFFFF },
+    { {124,102,123,  0}, 3, 0, 0xFFFF },
+    { { 66, 45, 64,  0}, 3, 0, 0xFFFF },
+    { { 45, 66, 46,  0}, 3, 0, 0xFFFF },
+    { { 46, 65, 44,  0}, 3, 0, 0xFFFF },
+    { { 65, 46, 66,  0}, 3, 0, 0xFFFF },
+    { { 29,130,128,  0}, 3, 0, 0xFFFF },
+    { {130, 29, 85,  0}, 3, 0, 0xFFFF },
+    { { 50,131, 28,  0}, 3, 0, 0x0008 },
+    { {131, 50,160,  0}, 3, 0, 0xFFFF },
+    { { 64,123,122,  0}, 3, 0, 0x0008 },
+    { {123, 64, 63,  0}, 3, 0, 0x0008 },
+    { { 43, 46, 44,  0}, 3, 0, 0xFFFF },
+    { { 43, 72, 46,  0}, 3, 0, 0x0008 },
+    { {104, 81,103,  0}, 3, 0, 0xFFFF },
+    { { 72, 81,104,  0}, 3, 0, 0x0008 },
+    { { 43, 81, 72,  0}, 3, 0, 0x0008 },
+    { { 73, 75, 76,  0}, 3, 0, 0x0008 },
+    { { 75, 73, 74,  0}, 3, 0, 0x0008 },
+    { { 77, 74, 73,  0}, 3, 0, 0x0008 },
+    { { 74, 77, 78,  0}, 3, 0, 0x0008 },
+    { { 78, 75, 74,  0}, 3, 0, 0x0008 },
+    { { 75, 78, 79,  0}, 3, 0, 0x0008 },
+    { { 79, 76, 75,  0}, 3, 0, 0x0008 },
+    { { 76, 79, 80,  0}, 3, 0, 0x0008 },
+    { { 80, 73, 76,  0}, 3, 0, 0x0008 },
+    { { 73, 80, 77,  0}, 3, 0, 0x0008 },
+    { { 81, 82, 83,  0}, 3, 0, 0xFFFF },
+    { { 86, 85,127,  0}, 3, 0, 0x0008 },
+    { { 84, 85, 86,  0}, 3, 0, 0x0008 },
+    { { 85, 82,130,  0}, 3, 0, 0xFFFF },
+    { { 84, 82, 85,  0}, 3, 0, 0x0008 },
+    { { 87, 88, 89,  0}, 3, 1, 0xFFFF },
+    { { 90,148,149,  0}, 3, 1, 0xFFFF },
+    { {148, 90, 87,  0}, 3, 1, 0xFFFF },
+    { {148, 93,150,  0}, 3, 1, 0xFFFF },
+    { { 93,148, 87,  0}, 3, 1, 0xFFFF },
+    { {150, 94,151,  0}, 3, 1, 0xFFFF },
+    { { 94,150, 93,  0}, 3, 1, 0xFFFF },
+    { { 97,159, 70,  0}, 3, 0, 0xFFFF },
+    { {159, 97, 98,  0}, 3, 0, 0xFFFF },
+    { { 99,145,100,  0}, 3, 1, 0xFFFF },
+    { { 99,147,145,  0}, 3, 1, 0xFFFF },
+    { { 99, 40,147,  0}, 3, 1, 0xFFFF },
+    { { 40,142, 39,  0}, 3, 1, 0xFFFF },
+    { { 40,140,142,  0}, 3, 1, 0xFFFF },
+    { { 99,140, 40,  0}, 3, 1, 0xFFFF },
+    { { 96,159, 98,  0}, 3, 1, 0xFFFF },
+    { {159, 96,158,  0}, 3, 1, 0xFFFF },
+    { { 71, 98, 97,  0}, 3, 1, 0xFFFF },
+    { { 98, 71,101,  0}, 3, 1, 0xFFFF },
+    { {102, 81, 83,  0}, 3, 0, 0xFFFF },
+    { { 81,102,103,  0}, 3, 0, 0xFFFF },
+    { {101,104,105,  0}, 3, 0, 0xFFFF },
+    { {104, 71, 72,  0}, 3, 0, 0xFFFF },
+    { {101, 71,104,  0}, 3, 0, 0xFFFF },
+    { { 89, 93, 87,  0}, 3, 0, 0xFFFF },
+    { { 93, 89,106,  0}, 3, 1, 0xFFFF },
+    { { 84,108, 83,  0}, 3, 0, 0xFFFF },
+    { {108, 84,107,  0}, 3, 0, 0x0008 },
+    { {109,151, 94,  0}, 3, 1, 0xFFFF },
+    { {109, 68,151,  0}, 3, 1, 0xFFFF },
+    { {109,160, 68,  0}, 3, 0, 0xFFFF },
+    { {109,110, 86,  0}, 3, 0, 0x0008 },
+    { {110,109, 94,  0}, 3, 1, 0xFFFF },
+    { {111, 87, 90,  0}, 3, 1, 0xFFFF },
+    { { 87,111, 88,  0}, 3, 1, 0xFFFF },
+    { {112, 99,100,  0}, 3, 1, 0xFFFF },
+    { { 99,112,113,  0}, 3, 1, 0xFFFF },
+    { { 86,107, 84,  0}, 3, 0, 0x0008 },
+    { {107, 86,114,  0}, 3, 0, 0x0008 },
+    { {108,102, 83,  0}, 3, 0, 0xFFFF },
+    { {102,133,132,  0}, 3, 0, 0xFFFF },
+    { {108,133,102,  0}, 3, 0, 0xFFFF },
+    { { 82, 84, 83,  0}, 3, 0, 0x0008 },
+    { {115,107,112,  0}, 3, 1, 0xFFFF },
+    { {112,114,113,  0}, 3, 1, 0xFFFF },
+    { {114,112,107,  0}, 3, 1, 0xFFFF },
+    { {117,114,116,  0}, 3, 1, 0xFFFF },
+    { {114,117,113,  0}, 3, 1, 0xFFFF },
+    { { 86,116,114,  0}, 3, 0, 0x0008 },
+    { {116, 86,110,  0}, 3, 0, 0x0008 },
+    { {120,108,107,  0}, 3, 0, 0xFFFF },
+    { {108,134,133,  0}, 3, 1, 0xFFFF },
+    { {134,108,118,  0}, 3, 1, 0xFFFF },
+    { {135,121, 95,  0}, 3, 0, 0xFFFF },
+    { {135,118,121,  0}, 3, 1, 0xFFFF },
+    { {135,134,118,  0}, 3, 1, 0xFFFF },
+    { {132,123,102,  0}, 3, 0, 0xFFFF },
+    { {105,123,132,  0}, 3, 0, 0xFFFF },
+    { {105,122,123,  0}, 3, 0, 0xFFFF },
+    { {104,124,125,  0}, 3, 0, 0xFFFF },
+    { {124,104,103,  0}, 3, 0, 0xFFFF },
+    { { 43, 82, 81,  0}, 3, 0, 0x0008 },
+    { { 82, 43,129,  0}, 3, 0, 0xFFFF },
+    { { 52,152, 33,  0}, 3, 1, 0xFFFF },
+    { { 52, 92,152,  0}, 3, 1, 0xFFFF },
+    { { 52,149, 92,  0}, 3, 1, 0xFFFF },
+    { { 52, 90,149,  0}, 3, 1, 0xFFFF },
+    { { 90,141,111,  0}, 3, 1, 0xFFFF },
+    { { 90,143,141,  0}, 3, 1, 0xFFFF },
+    { { 52,143, 90,  0}, 3, 1, 0xFFFF },
+    { {126,131,127,  0}, 3, 0, 0x0008 },
+    { { 66,124, 65,  0}, 3, 0, 0x0008 },
+    { {124, 66,125,  0}, 3, 0, 0x0008 },
+    { { 85,126,127,  0}, 3, 0, 0xFFFF },
+    { {126, 85, 29,  0}, 3, 0, 0xFFFF },
+    { { 82,128,130,  0}, 3, 0, 0xFFFF },
+    { {128, 82,129,  0}, 3, 0, 0xFFFF },
+    { {127,131, 86,  0}, 3, 0, 0x0008 },
+    { {131,126, 28,  0}, 3, 0, 0x0008 },
+    { {138, 37,139,  0}, 3, 1, 0xFFFF },
+    { { 37,138, 38,  0}, 3, 1, 0xFFFF },
+    { { 94,106,110,  0}, 3, 1, 0xFFFF },
+    { {106, 94, 93,  0}, 3, 1, 0xFFFF },
+    { {119,107,115,  0}, 3, 1, 0xFFFF },
+    { {107,119,120,  0}, 3, 0, 0xFFFF },
+    { { 60, 48, 59,  0}, 3, 0, 0xFFFF },
+    { {125,105,104,  0}, 3, 0, 0xFFFF },
+    { {105,125,122,  0}, 3, 0, 0xFFFF },
+    { { 66,122,125,  0}, 3, 0, 0x0008 },
+    { {122, 66, 64,  0}, 3, 0, 0x0008 },
+    { { 42, 65, 63,  0}, 3, 0, 0xFFFF },
+    { { 65, 42, 44,  0}, 3, 0, 0xFFFF },
+    { { 63,124,123,  0}, 3, 0, 0x0008 },
+    { {124, 63, 65,  0}, 3, 0, 0x0008 },
+    { {132,101,105,  0}, 3, 0, 0xFFFF },
+    { {101,132,133,  0}, 3, 0, 0xFFFF },
+    { {133, 98,101,  0}, 3, 0, 0xFFFF },
+    { { 98,133,134,  0}, 3, 1, 0xFFFF },
+    { {134, 96, 98,  0}, 3, 1, 0xFFFF },
+    { { 96,134,135,  0}, 3, 1, 0xFFFF },
+    { { 42, 48, 26,  0}, 3, 0, 0xFFFF },
+    { { 42,137, 48,  0}, 3, 0, 0xFFFF },
+    { {136,137, 42,  0}, 3, 0, 0xFFFF },
+    { { 48,138, 59,  0}, 3, 1, 0xFFFF },
+    { {138, 48,137,  0}, 3, 1, 0xFFFF },
+    { {138, 62, 59,  0}, 3, 1, 0xFFFF },
+    { {138, 36, 62,  0}, 3, 1, 0xFFFF },
+    { {138,139, 36,  0}, 3, 1, 0xFFFF },
+    { {108,120,118,  0}, 3, 0, 0xFFFF },
+    { { 48, 60, 49,  0}, 3, 0, 0xFFFF },
+    { {142,141,143,  0}, 3, 1, 0xFFFF },
+    { {141,142,140,  0}, 3, 1, 0xFFFF },
+    { {144,147,146,  0}, 3, 1, 0xFFFF },
+    { {147,144,145,  0}, 3, 1, 0xFFFF },
+    { { 92,148, 91,  0}, 3, 1, 0xFFFF },
+    { {148, 92,149,  0}, 3, 1, 0xFFFF },
+    { {148, 67, 91,  0}, 3, 1, 0xFFFF },
+    { { 67,148,150,  0}, 3, 1, 0xFFFF },
+    { {150, 68, 67,  0}, 3, 1, 0xFFFF },
+    { { 68,150,151,  0}, 3, 1, 0xFFFF },
+    { { 91,152, 92,  0}, 3, 1, 0xFFFF },
+    { {152, 91,153,  0}, 3, 1, 0xFFFF },
+    { { 67,153, 91,  0}, 3, 1, 0xFFFF },
+    { {153, 67,154,  0}, 3, 1, 0xFFFF },
+    { { 68,154, 67,  0}, 3, 1, 0xFFFF },
+    { {154, 68,155,  0}, 3, 1, 0xFFFF },
+    { { 69,157, 70,  0}, 3, 1, 0xFFFF },
+    { {157, 69,156,  0}, 3, 1, 0xFFFF },
+    { {159, 69, 70,  0}, 3, 1, 0xFFFF },
+    { { 69,159,158,  0}, 3, 1, 0xFFFF },
+    { {131,109, 86,  0}, 3, 0, 0x0008 },
+    { {109,131,160,  0}, 3, 0, 0xFFFF },
+    { {164,173,172,  0}, 3, 0, 0x0000 },
+    { {172,163,164,  0}, 3, 0, 0x0000 },
+    { {166,175,174,  0}, 3, 0, 0x0000 },
+    { {174,165,166,  0}, 3, 0, 0x0000 },
+    { {168,177,176,  0}, 3, 0, 0x0000 },
+    { {176,167,168,  0}, 3, 0, 0x0000 },
+    { {169,178,177,  0}, 3, 0, 0x0000 },
+    { {177,168,169,  0}, 3, 0, 0x0000 },
+    { {161,170,178,  0}, 3, 0, 0x0000 },
+    { {178,169,161,  0}, 3, 0, 0x0000 },
+    { {163,162,161,  0}, 3, 0, 0x0000 },
+    { {161,164,163,  0}, 3, 0, 0x0000 },
+    { {164,161,169,  0}, 3, 0, 0x0000 },
+    { {169,165,164,  0}, 3, 0, 0x0000 },
+    { {165,169,168,  0}, 3, 0, 0x0000 },
+    { {168,166,165,  0}, 3, 0, 0x0000 },
+    { {167,166,168,  0}, 3, 0, 0x0000 },
+    { {170,161,162,  0}, 3, 0, 0x0000 },
+    { {162,171,170,  0}, 3, 0, 0x0000 },
+    { {171,162,163,  0}, 3, 0, 0x0000 },
+    { {163,172,171,  0}, 3, 0, 0x0000 },
+    { {173,164,165,  0}, 3, 0, 0x0000 },
+    { {165,174,173,  0}, 3, 0, 0x0000 },
+    { {175,166,167,  0}, 3, 0, 0x0000 },
+    { {167,176,175,  0}, 3, 0, 0x0000 },
+    { {172,173,170,  0}, 3, 0, 0x0000 },
+    { {170,171,172,  0}, 3, 0, 0x0000 },
+    { {173,174,178,  0}, 3, 0, 0x0000 },
+    { {178,170,173,  0}, 3, 0, 0x0000 },
+    { {174,175,177,  0}, 3, 0, 0x0000 },
+    { {177,178,174,  0}, 3, 0, 0x0000 },
+    { {176,177,175,  0}, 3, 0, 0x0000 },
+    { {182,190,191,  0}, 3, 0, 0x0000 },
+    { {190,182,181,  0}, 3, 0, 0x0000 },
+    { {184,192,193,  0}, 3, 0, 0x0000 },
+    { {192,184,183,  0}, 3, 0, 0x0000 },
+    { {186,194,195,  0}, 3, 0, 0x0000 },
+    { {194,186,185,  0}, 3, 0, 0x0000 },
+    { {187,195,196,  0}, 3, 0, 0x0000 },
+    { {195,187,186,  0}, 3, 0, 0x0000 },
+    { {179,196,188,  0}, 3, 0, 0x0000 },
+    { {196,179,187,  0}, 3, 0, 0x0000 },
+    { {181,179,180,  0}, 3, 0, 0x0000 },
+    { {179,181,182,  0}, 3, 0, 0x0000 },
+    { {182,187,179,  0}, 3, 0, 0x0000 },
+    { {187,182,183,  0}, 3, 0, 0x0000 },
+    { {183,186,187,  0}, 3, 0, 0x0000 },
+    { {186,183,184,  0}, 3, 0, 0x0000 },
+    { {185,186,184,  0}, 3, 0, 0x0000 },
+    { {188,180,179,  0}, 3, 0, 0x0000 },
+    { {180,188,189,  0}, 3, 0, 0x0000 },
+    { {189,181,180,  0}, 3, 0, 0x0000 },
+    { {181,189,190,  0}, 3, 0, 0x0000 },
+    { {191,183,182,  0}, 3, 0, 0x0000 },
+    { {183,191,192,  0}, 3, 0, 0x0000 },
+    { {193,185,184,  0}, 3, 0, 0x0000 },
+    { {185,193,194,  0}, 3, 0, 0x0000 },
+    { {190,188,191,  0}, 3, 0, 0x0000 },
+    { {188,190,189,  0}, 3, 0, 0x0000 },
+    { {191,196,192,  0}, 3, 0, 0x0000 },
+    { {196,191,188,  0}, 3, 0, 0x0000 },
+    { {192,195,193,  0}, 3, 0, 0x0000 },
+    { {195,192,196,  0}, 3, 0, 0x0000 },
+    { {194,193,195,  0}, 3, 0, 0x0000 },
+    { {200,208,209,  0}, 3, 0, 0x0000 },
+    { {208,200,199,  0}, 3, 0, 0x0000 },
+    { {202,210,211,  0}, 3, 0, 0x0000 },
+    { {210,202,201,  0}, 3, 0, 0x0000 },
+    { {204,212,213,  0}, 3, 0, 0x0000 },
+    { {212,204,203,  0}, 3, 0, 0x0000 },
+    { {205,213,214,  0}, 3, 0, 0x0000 },
+    { {213,205,204,  0}, 3, 0, 0x0000 },
+    { {197,214,206,  0}, 3, 0, 0x0000 },
+    { {214,197,205,  0}, 3, 0, 0x0000 },
+    { {199,197,198,  0}, 3, 0, 0x0000 },
+    { {197,199,200,  0}, 3, 0, 0x0000 },
+    { {200,205,197,  0}, 3, 0, 0x0000 },
+    { {205,200,201,  0}, 3, 0, 0x0000 },
+    { {201,204,205,  0}, 3, 0, 0x0000 },
+    { {204,201,202,  0}, 3, 0, 0x0000 },
+    { {203,204,202,  0}, 3, 0, 0x0000 },
+    { {206,198,197,  0}, 3, 0, 0x0000 },
+    { {198,206,207,  0}, 3, 0, 0x0000 },
+    { {207,199,198,  0}, 3, 0, 0x0000 },
+    { {199,207,208,  0}, 3, 0, 0x0000 },
+    { {209,201,200,  0}, 3, 0, 0x0000 },
+    { {201,209,210,  0}, 3, 0, 0x0000 },
+    { {211,203,202,  0}, 3, 0, 0x0000 },
+    { {203,211,212,  0}, 3, 0, 0x0000 },
+    { {208,206,209,  0}, 3, 0, 0x0000 },
+    { {206,208,207,  0}, 3, 0, 0x0000 },
+    { {209,214,210,  0}, 3, 0, 0x0000 },
+    { {214,209,206,  0}, 3, 0, 0x0000 },
+    { {210,213,211,  0}, 3, 0, 0x0000 },
+    { {213,210,214,  0}, 3, 0, 0x0000 },
+    { {212,211,213,  0}, 3, 0, 0x0000 }
+};
+
+const Point3D car_normals[368] = {
+    {  0.0000f, -0.9388f,  0.3444f },
+    {  0.0000f, -0.9388f,  0.3444f },
+    {  0.0000f, -0.5039f, -0.8638f },
+    { -0.0000f, -0.5039f, -0.8638f },
+    {  0.0000f,  0.7682f, -0.6402f },
+    {  0.0000f,  0.7682f, -0.6402f },
+    {  0.0000f,  1.0000f, -0.0056f },
+    {  0.0000f,  1.0000f, -0.0056f },
+    { -0.0000f,  0.7655f,  0.6435f },
+    {  0.0000f,  0.7655f,  0.6435f },
+    { -1.0000f,  0.0000f,  0.0000f },
+    { -1.0000f,  0.0000f,  0.0000f },
+    { -1.0000f,  0.0000f,  0.0000f },
+    { -1.0000f,  0.0000f,  0.0000f },
+    { -1.0000f,  0.0000f,  0.0000f },
+    { -1.0000f,  0.0000f,  0.0000f },
+    { -1.0000f, -0.0000f,  0.0000f },
+    {  0.0000f,  0.1779f,  0.9840f },
+    { -0.0000f,  0.1779f,  0.9840f },
+    {  0.0000f, -0.4997f,  0.8662f },
+    {  0.0000f, -0.4997f,  0.8662f },
+    { -0.0000f, -0.9406f, -0.3395f },
+    {  0.0000f, -0.9406f, -0.3395f },
+    {  0.0000f,  0.1716f, -0.9852f },
+    {  0.0000f,  0.1716f, -0.9852f },
+    {  1.0000f, -0.0000f,  0.0000f },
+    {  1.0000f,  0.0000f,  0.0000f },
+    {  1.0000f, -0.0000f,  0.0000f },
+    {  1.0000f,  0.0000f,  0.0000f },
+    {  1.0000f, -0.0000f,  0.0000f },
+    {  1.0000f,  0.0000f, -0.0000f },
+    {  1.0000f,  0.0000f, -0.0000f },
+    { -0.9861f,  0.1643f, -0.0261f },
+    { -0.9822f,  0.1878f,  0.0000f },
+    {  0.0000f, -0.9876f,  0.1568f },
+    {  0.0000f, -0.9876f,  0.1568f },
+    {  0.0000f,  0.0000f, -1.0000f },
+    {  0.0000f, -0.0000f, -1.0000f },
+    {  0.0681f,  0.9975f,  0.0180f },
+    {  0.0627f,  0.9980f,  0.0000f },
+    {  0.0000f,  0.0000f,  1.0000f },
+    {  0.0000f,  0.0000f,  1.0000f },
+    { -0.2516f,  0.7882f, -0.5617f },
+    { -0.8958f,  0.4269f,  0.1239f },
+    { -0.3249f,  0.9449f,  0.0408f },
+    { -0.9098f,  0.4151f,  0.0023f },
+    { -0.9036f,  0.4283f, -0.0052f },
+    { -0.9635f,  0.0057f,  0.2677f },
+    { -0.1942f, -0.0276f,  0.9806f },
+    { -0.2524f,  0.0534f,  0.9661f },
+    { -0.1661f,  0.6002f,  0.7824f },
+    { -0.1347f,  0.6540f,  0.7444f },
+    { -0.2066f,  0.2122f,  0.9551f },
+    { -0.2026f,  0.2208f,  0.9541f },
+    { -0.0076f, -0.9995f,  0.0308f },
+    { -0.0004f, -1.0000f,  0.0098f },
+    {  0.0009f, -1.0000f,  0.0036f },
+    {  0.0002f, -1.0000f,  0.0048f },
+    {  0.0008f, -1.0000f,  0.0032f },
+    { -0.0030f, -0.9998f,  0.0183f },
+    {  0.0000f, -1.0000f,  0.0037f },
+    {  0.0000f, -1.0000f,  0.0037f },
+    {  0.0000f, -1.0000f,  0.0037f },
+    { -0.0002f,  0.9999f, -0.0132f },
+    {  0.0008f,  0.9999f, -0.0172f },
+    { -0.2363f, -0.1165f, -0.9647f },
+    { -0.3107f, -0.0427f, -0.9496f },
+    { -0.0489f, -0.0427f, -0.9979f },
+    { -0.0713f,  0.0291f, -0.9970f },
+    {  0.0021f,  0.9692f, -0.2463f },
+    { -0.0153f,  0.9942f,  0.1062f },
+    { -0.0403f,  0.3629f, -0.9310f },
+    { -0.0698f,  0.2578f, -0.9637f },
+    { -0.2775f,  0.3786f, -0.8830f },
+    { -0.9333f,  0.1908f,  0.3041f },
+    { -0.5284f,  0.7535f,  0.3912f },
+    { -0.8452f,  0.5311f,  0.0589f },
+    { -0.6045f,  0.7963f,  0.0204f },
+    { -0.0055f,  0.9377f,  0.3473f },
+    { -0.1115f,  0.8433f,  0.5258f },
+    { -0.1180f,  0.8387f,  0.5317f },
+    { -0.8720f,  0.1980f,  0.4477f },
+    { -0.7772f,  0.5216f,  0.3521f },
+    { -0.8373f,  0.4064f,  0.3657f },
+    { -0.5662f,  0.8156f,  0.1191f },
+    { -0.9613f, -0.0685f,  0.2668f },
+    { -0.9683f, -0.0413f,  0.2465f },
+    { -0.9918f, -0.1278f,  0.0033f },
+    { -0.9925f, -0.1220f,  0.0043f },
+    { -0.8025f,  0.5965f,  0.0143f },
+    { -0.6015f,  0.7988f, -0.0023f },
+    { -0.9320f,  0.3562f, -0.0666f },
+    { -0.6174f,  0.4874f, -0.6174f },
+    { -0.9113f,  0.4098f,  0.0413f },
+    { -0.9926f,  0.0218f,  0.1193f },
+    { -0.9990f,  0.0440f,  0.0086f },
+    { -0.9978f,  0.0668f,  0.0047f },
+    { -0.9856f,  0.0653f, -0.1562f },
+    { -0.9911f,  0.1157f, -0.0660f },
+    { -0.8506f,  0.5258f,  0.0000f },
+    { -0.7883f,  0.6129f,  0.0542f },
+    { -0.9955f,  0.0736f,  0.0603f },
+    { -0.8998f,  0.4357f, -0.0227f },
+    { -0.6949f,  0.1851f, -0.6949f },
+    { -0.7792f,  0.1569f, -0.6068f },
+    { -0.9980f, -0.0224f, -0.0585f },
+    { -0.9337f,  0.1810f, -0.3088f },
+    { -0.9974f, -0.0111f, -0.0712f },
+    {  0.0072f,  0.6837f,  0.7297f },
+    { -0.0030f,  0.6787f,  0.7344f },
+    { -0.1672f, -0.3523f, -0.9208f },
+    { -0.2852f, -0.3081f, -0.9076f },
+    {  0.9998f, -0.0180f,  0.0000f },
+    {  0.9999f, -0.0106f, -0.0047f },
+    {  0.0000f,  0.9992f,  0.0402f },
+    {  0.0000f,  0.9992f,  0.0402f },
+    { -0.0590f,  0.9956f,  0.0723f },
+    { -0.0032f,  0.9920f,  0.1262f },
+    { -0.0000f,  1.0000f,  0.0053f },
+    {  0.0000f,  1.0000f,  0.0053f },
+    { -0.0148f,  0.9999f,  0.0000f },
+    { -0.0128f,  0.9999f, -0.0018f },
+    {  0.0148f,  0.9999f, -0.0000f },
+    {  0.0128f,  0.9999f, -0.0018f },
+    { -0.0000f,  1.0000f,  0.0063f },
+    {  0.9822f,  0.1878f,  0.0000f },
+    {  0.9858f,  0.1664f, -0.0238f },
+    {  0.0000f, -0.9899f,  0.1414f },
+    {  0.0000f, -0.9899f,  0.1414f },
+    {  0.0000f,  0.0000f, -1.0000f },
+    {  0.0446f, -0.1049f, -0.9935f },
+    { -0.0662f,  0.9978f,  0.0000f },
+    { -0.0607f,  0.9980f, -0.0165f },
+    { -0.0326f, -0.0062f,  0.9994f },
+    {  0.0000f,  0.1263f,  0.9920f },
+    {  0.2490f,  0.7896f, -0.5608f },
+    {  0.9380f,  0.3368f, -0.0821f },
+    {  0.8956f,  0.4449f, -0.0058f },
+    {  0.9453f,  0.3256f,  0.0210f },
+    {  0.9139f,  0.4053f,  0.0221f },
+    {  0.9643f,  0.0041f,  0.2647f },
+    {  0.2902f,  0.0476f,  0.9558f },
+    {  0.2282f, -0.0297f,  0.9732f },
+    {  0.1881f,  0.6428f,  0.7426f },
+    {  0.1692f,  0.6712f,  0.7217f },
+    {  0.2452f,  0.2103f,  0.9464f },
+    {  0.2394f,  0.2212f,  0.9454f },
+    { -0.0164f,  0.9998f, -0.0132f },
+    { -0.0110f,  0.9999f,  0.0115f },
+    {  0.0000f, -1.0000f,  0.0063f },
+    {  0.0000f, -1.0000f,  0.0063f },
+    {  0.0000f, -1.0000f,  0.0063f },
+    {  0.0000f, -1.0000f,  0.0063f },
+    {  0.0000f, -1.0000f,  0.0063f },
+    {  0.0000f, -1.0000f,  0.0063f },
+    {  0.3448f,  0.0051f, -0.9387f },
+    {  0.2382f, -0.0972f, -0.9663f },
+    {  0.0747f, -0.0426f, -0.9963f },
+    {  0.0708f, -0.0553f, -0.9960f },
+    {  0.0160f,  0.9944f,  0.1040f },
+    { -0.0025f,  0.9677f, -0.2521f },
+    {  0.2772f,  0.3807f, -0.8821f },
+    {  0.0403f,  0.3629f, -0.9310f },
+    {  0.0696f,  0.2583f, -0.9635f },
+    {  0.5635f,  0.7543f,  0.3368f },
+    {  0.8373f,  0.3076f,  0.4521f },
+    {  0.8651f,  0.4976f,  0.0627f },
+    {  0.6045f,  0.7963f,  0.0204f },
+    {  0.1411f,  0.8350f,  0.5318f },
+    {  0.0900f,  0.8665f,  0.4911f },
+    {  0.0055f,  0.9377f,  0.3473f },
+    {  0.5674f,  0.8147f,  0.1200f },
+    {  0.8357f,  0.4115f,  0.3636f },
+    {  0.9673f, -0.0453f,  0.2495f },
+    {  0.9624f, -0.0646f,  0.2640f },
+    {  0.9925f, -0.1220f,  0.0043f },
+    {  0.9918f, -0.1278f,  0.0033f },
+    {  0.6015f,  0.7989f, -0.0028f },
+    {  0.8083f,  0.5886f,  0.0142f },
+    {  0.8519f,  0.4874f, -0.1916f },
+    {  0.8729f,  0.4743f, -0.1146f },
+    {  0.8310f,  0.5363f, -0.1476f },
+    {  0.9098f,  0.4119f,  0.0508f },
+    {  0.9926f,  0.0218f,  0.1193f },
+    {  0.9978f,  0.0668f,  0.0047f },
+    {  0.9990f,  0.0440f,  0.0086f },
+    {  0.9911f,  0.1157f, -0.0660f },
+    {  0.9856f,  0.0653f, -0.1562f },
+    {  0.7950f,  0.6044f,  0.0518f },
+    {  0.8540f,  0.5202f, -0.0000f },
+    {  0.9240f,  0.3821f, -0.0139f },
+    {  0.9663f,  0.1927f, -0.1706f },
+    {  0.9430f,  0.2659f, -0.2002f },
+    {  0.9801f, -0.1364f, -0.1442f },
+    {  0.9080f,  0.1916f, -0.3726f },
+    {  0.9834f, -0.0189f, -0.1802f },
+    {  0.9623f,  0.2407f, -0.1263f },
+    {  0.2022f,  0.6399f, -0.7414f },
+    {  0.9977f, -0.0244f, -0.0638f },
+    { -1.0000f, -0.0090f,  0.0000f },
+    { -1.0000f, -0.0090f,  0.0000f },
+    {  0.0000f,  0.8717f, -0.4900f },
+    {  0.0000f,  0.8717f, -0.4900f },
+    {  0.0039f, -0.9999f, -0.0148f },
+    { -0.0021f, -1.0000f, -0.0086f },
+    {  0.0013f, -0.9999f, -0.0140f },
+    { -0.0018f, -1.0000f, -0.0059f },
+    {  0.0000f, -0.9999f, -0.0138f },
+    {  0.0000f, -0.9999f, -0.0138f },
+    {  0.0000f, -0.9999f, -0.0138f },
+    { -0.0000f,  0.8893f,  0.4574f },
+    {  0.0000f, -1.0000f,  0.0000f },
+    {  0.0000f, -1.0000f, -0.0000f },
+    {  0.0000f,  0.9940f,  0.1095f },
+    {  0.0000f,  0.9940f,  0.1095f },
+    {  0.0000f,  0.9668f, -0.2554f },
+    {  0.0000f,  0.9668f, -0.2554f },
+    {  0.1471f,  0.8348f,  0.5305f },
+    { -0.1473f,  0.8347f,  0.5306f },
+    { -0.7072f, -0.0195f, -0.7068f },
+    { -0.7935f, -0.0474f, -0.6067f },
+    {  0.7790f,  0.5197f,  0.3508f },
+    {  0.8741f,  0.1900f,  0.4471f },
+    {  0.9955f,  0.0736f,  0.0603f },
+    {  0.8998f,  0.4357f, -0.0227f },
+    { -0.9598f,  0.2441f, -0.1382f },
+    {  0.2852f, -0.3081f, -0.9076f },
+    {  0.1672f, -0.3523f, -0.9208f },
+    {  0.0000f, -0.2060f, -0.9785f },
+    { -0.0000f, -0.2060f, -0.9785f },
+    {  0.0028f,  0.6786f,  0.7345f },
+    { -0.0061f,  0.6838f,  0.7297f },
+    { -0.0000f,  0.6766f,  0.7363f },
+    {  0.0000f,  0.6766f,  0.7363f },
+    {  0.2442f,  0.3727f, -0.8953f },
+    {  0.6638f,  0.3194f, -0.6763f },
+    {  0.6958f,  0.1157f, -0.7089f },
+    {  0.6748f,  0.1212f, -0.7279f },
+    {  0.6756f, -0.0033f, -0.7373f },
+    {  0.6835f, -0.0057f, -0.7299f },
+    { -0.8451f,  0.5296f, -0.0733f },
+    { -0.8906f,  0.4243f, -0.1637f },
+    { -0.7556f,  0.6054f, -0.2499f },
+    { -0.9421f,  0.2669f, -0.2030f },
+    { -0.9637f,  0.2004f, -0.1765f },
+    { -0.9760f,  0.0997f, -0.1938f },
+    { -0.9558f, -0.1197f, -0.2684f },
+    { -0.9877f, -0.0221f, -0.1547f },
+    {  0.9598f,  0.2441f, -0.1382f },
+    { -0.9240f,  0.3821f, -0.0139f },
+    {  0.0000f, -0.9998f, -0.0220f },
+    {  0.0000f, -0.9998f, -0.0220f },
+    { -0.0000f, -0.9992f, -0.0409f },
+    {  0.0000f, -0.9992f, -0.0409f },
+    {  0.1138f,  0.0774f,  0.9905f },
+    {  0.1354f,  0.0493f,  0.9896f },
+    {  0.0992f,  0.5157f,  0.8510f },
+    {  0.1289f,  0.6490f,  0.7498f },
+    {  0.1657f,  0.2102f,  0.9635f },
+    {  0.1669f,  0.2139f,  0.9625f },
+    { -0.1625f,  0.0769f,  0.9837f },
+    { -0.1440f,  0.0547f,  0.9881f },
+    { -0.1350f,  0.5136f,  0.8474f },
+    { -0.1573f,  0.6011f,  0.7836f },
+    { -0.1924f,  0.2092f,  0.9588f },
+    { -0.1937f,  0.2128f,  0.9577f },
+    { -0.0140f, -0.1047f, -0.9944f },
+    { -0.0314f, -0.1198f, -0.9923f },
+    {  0.0420f, -0.1046f, -0.9936f },
+    {  0.0370f, -0.1000f, -0.9943f },
+    {  0.0589f,  0.9956f,  0.0723f },
+    {  0.0032f,  0.9920f,  0.1262f },
+    {  0.0000f, -0.9388f,  0.3444f },
+    {  0.0000f, -0.9388f,  0.3444f },
+    {  0.0000f, -0.4997f, -0.8662f },
+    { -0.0000f, -0.4997f, -0.8662f },
+    {  0.0000f,  0.7682f, -0.6402f },
+    {  0.0000f,  0.7682f, -0.6402f },
+    {  0.0000f,  1.0000f, -0.0056f },
+    {  0.0000f,  1.0000f, -0.0056f },
+    { -0.0000f,  0.7655f,  0.6435f },
+    {  0.0000f,  0.7655f,  0.6435f },
+    { -1.0000f,  0.0000f,  0.0000f },
+    { -1.0000f,  0.0000f,  0.0000f },
+    { -1.0000f,  0.0000f,  0.0000f },
+    { -1.0000f,  0.0000f,  0.0000f },
+    { -1.0000f,  0.0000f,  0.0000f },
+    { -1.0000f,  0.0000f,  0.0000f },
+    { -1.0000f, -0.0000f,  0.0000f },
+    {  0.0000f,  0.1779f,  0.9840f },
+    { -0.0000f,  0.1779f,  0.9840f },
+    {  0.0000f, -0.4997f,  0.8662f },
+    {  0.0000f, -0.4997f,  0.8662f },
+    { -0.0000f, -0.9412f, -0.3377f },
+    {  0.0000f, -0.9412f, -0.3377f },
+    {  0.0000f,  0.1716f, -0.9852f },
+    {  0.0000f,  0.1716f, -0.9852f },
+    {  1.0000f, -0.0000f,  0.0000f },
+    {  1.0000f,  0.0000f,  0.0000f },
+    {  1.0000f, -0.0000f,  0.0000f },
+    {  1.0000f,  0.0000f,  0.0000f },
+    {  1.0000f, -0.0000f,  0.0000f },
+    {  1.0000f,  0.0000f, -0.0000f },
+    {  1.0000f,  0.0000f, -0.0000f },
+    {  0.0000f, -0.9388f,  0.3444f },
+    {  0.0000f, -0.9388f,  0.3444f },
+    { -0.0000f, -0.4997f, -0.8662f },
+    {  0.0000f, -0.4997f, -0.8662f },
+    {  0.0000f,  0.7682f, -0.6402f },
+    {  0.0000f,  0.7682f, -0.6402f },
+    {  0.0000f,  1.0000f, -0.0056f },
+    {  0.0000f,  1.0000f, -0.0056f },
+    {  0.0000f,  0.7655f,  0.6435f },
+    { -0.0000f,  0.7655f,  0.6435f },
+    {  1.0000f,  0.0000f,  0.0000f },
+    {  1.0000f,  0.0000f,  0.0000f },
+    {  1.0000f,  0.0000f,  0.0000f },
+    {  1.0000f,  0.0000f,  0.0000f },
+    {  1.0000f,  0.0000f,  0.0000f },
+    {  1.0000f,  0.0000f,  0.0000f },
+    {  1.0000f,  0.0000f, -0.0000f },
+    { -0.0000f,  0.1779f,  0.9840f },
+    {  0.0000f,  0.1779f,  0.9840f },
+    {  0.0000f, -0.4997f,  0.8662f },
+    {  0.0000f, -0.4997f,  0.8662f },
+    {  0.0000f, -0.9412f, -0.3377f },
+    { -0.0000f, -0.9412f, -0.3377f },
+    {  0.0000f,  0.1716f, -0.9852f },
+    {  0.0000f,  0.1716f, -0.9852f },
+    { -1.0000f,  0.0000f, -0.0000f },
+    { -1.0000f, -0.0000f,  0.0000f },
+    { -1.0000f,  0.0000f,  0.0000f },
+    { -1.0000f, -0.0000f,  0.0000f },
+    { -1.0000f,  0.0000f,  0.0000f },
+    { -1.0000f, -0.0000f,  0.0000f },
+    { -1.0000f, -0.0000f,  0.0000f },
+    {  0.0000f, -0.9388f,  0.3444f },
+    {  0.0000f, -0.9388f,  0.3444f },
+    { -0.0000f, -0.5039f, -0.8638f },
+    {  0.0000f, -0.5039f, -0.8638f },
+    {  0.0000f,  0.7682f, -0.6402f },
+    {  0.0000f,  0.7682f, -0.6402f },
+    {  0.0000f,  1.0000f, -0.0056f },
+    {  0.0000f,  1.0000f, -0.0056f },
+    {  0.0000f,  0.7655f,  0.6435f },
+    { -0.0000f,  0.7655f,  0.6435f },
+    {  1.0000f,  0.0000f,  0.0000f },
+    {  1.0000f,  0.0000f,  0.0000f },
+    {  1.0000f,  0.0000f,  0.0000f },
+    {  1.0000f,  0.0000f,  0.0000f },
+    {  1.0000f,  0.0000f,  0.0000f },
+    {  1.0000f,  0.0000f,  0.0000f },
+    {  1.0000f,  0.0000f, -0.0000f },
+    { -0.0000f,  0.1779f,  0.9840f },
+    {  0.0000f,  0.1779f,  0.9840f },
+    {  0.0000f, -0.4997f,  0.8662f },
+    {  0.0000f, -0.4997f,  0.8662f },
+    {  0.0000f, -0.9406f, -0.3395f },
+    { -0.0000f, -0.9406f, -0.3395f },
+    {  0.0000f,  0.1716f, -0.9852f },
+    {  0.0000f,  0.1716f, -0.9852f },
+    { -1.0000f,  0.0000f, -0.0000f },
+    { -1.0000f, -0.0000f,  0.0000f },
+    { -1.0000f,  0.0000f,  0.0000f },
+    { -1.0000f, -0.0000f,  0.0000f },
+    { -1.0000f,  0.0000f,  0.0000f },
+    { -1.0000f, -0.0000f,  0.0000f },
+    { -1.0000f, -0.0000f,  0.0000f }
+};
+
+const Point3D lod_car_vertices[32] = {
+    { -0.6000f,  0.1000f,  1.4000f },
+    { -0.5000f,  0.4000f,  1.2000f },
+    { -0.5000f,  0.4500f,  0.5000f },
+    { -0.4000f,  0.8000f,  0.1000f },
+    { -0.4000f,  0.7500f, -0.6000f },
+    { -0.5000f,  0.5000f, -1.2000f },
+    { -0.6000f,  0.2000f, -1.3000f },
+    { -0.6000f,  0.1000f, -1.3000f },
+    {  0.6000f,  0.1000f,  1.4000f },
+    {  0.5000f,  0.4000f,  1.2000f },
+    {  0.5000f,  0.4500f,  0.5000f },
+    {  0.4000f,  0.8000f,  0.1000f },
+    {  0.4000f,  0.7500f, -0.6000f },
+    {  0.5000f,  0.5000f, -1.2000f },
+    {  0.6000f,  0.2000f, -1.3000f },
+    {  0.6000f,  0.1000f, -1.3000f },
+    { -0.6500f, -0.0500f,  1.1000f },
+    { -0.6500f,  0.2500f,  1.1000f },
+    { -0.6500f,  0.2500f,  0.5000f },
+    { -0.6500f, -0.0500f,  0.5000f },
+    { -0.6500f, -0.0500f, -0.6000f },
+    { -0.6500f,  0.2500f, -0.6000f },
+    { -0.6500f,  0.2500f, -1.2000f },
+    { -0.6500f, -0.0500f, -1.2000f },
+    {  0.6500f, -0.0500f,  1.1000f },
+    {  0.6500f,  0.2500f,  1.1000f },
+    {  0.6500f,  0.2500f,  0.5000f },
+    {  0.6500f, -0.0500f,  0.5000f },
+    {  0.6500f, -0.0500f, -0.6000f },
+    {  0.6500f,  0.2500f, -0.6000f },
+    {  0.6500f,  0.2500f, -1.2000f },
+    {  0.6500f, -0.0500f, -1.2000f }
+};
+
+const Face lod_car_faces[23] = {
+    { {  0,  8,  9,  1}, 4, 0, 0x3186 },
+    { {  1,  9, 10,  2}, 4, 0, 0xFFFF },
+    { {  2, 10, 11,  3}, 4, 0, 0x0008 },
+    { {  3, 11, 12,  4}, 4, 0, 0xFFFF },
+    { {  4, 12, 13,  5}, 4, 0, 0x0008 },
+    { {  5, 13, 14,  6}, 4, 0, 0xFFFF },
+    { {  6, 14, 15,  7}, 4, 0, 0x3186 },
+    { {  0,  1,  2,  0}, 3, 0, 0xFFFF },
+    { {  2,  3,  4,  0}, 3, 0, 0xFFFF },
+    { {  4,  5,  6,  0}, 3, 0, 0xFFFF },
+    { {  0,  2,  4,  0}, 3, 0, 0xFFFF },
+    { {  0,  4,  6,  0}, 3, 0, 0xFFFF },
+    { {  0,  6,  7,  0}, 3, 0, 0x18C3 },
+    { {  8, 10,  9,  0}, 3, 0, 0xFFFF },
+    { { 10, 12, 11,  0}, 3, 0, 0xFFFF },
+    { { 12, 14, 13,  0}, 3, 0, 0xFFFF },
+    { {  8, 12, 10,  0}, 3, 0, 0xFFFF },
+    { {  8, 14, 12,  0}, 3, 0, 0xFFFF },
+    { {  8, 15, 14,  0}, 3, 0, 0x18C3 },
+    { { 16, 17, 18, 19}, 4, 1, 0x0000 },
+    { { 20, 21, 22, 23}, 4, 1, 0x0000 },
+    { { 24, 25, 26, 27}, 4, 1, 0x0000 },
+    { { 28, 29, 30, 31}, 4, 1, 0x0000 }
+};
+
+const Point3D lod_car_normals[23] = {
+    {  0.0000f,  0.5547f,  0.8321f },
+    {  0.0000f,  0.9975f,  0.0712f },
+    {  0.0000f,  0.7526f,  0.6585f },
+    {  0.0000f,  0.9975f, -0.0712f },
+    {  0.0000f,  0.9231f, -0.3846f },
+    {  0.0000f,  0.3162f, -0.9487f },
+    {  0.0000f,  0.0000f, -1.0000f },
+    { -0.9436f,  0.3303f,  0.0236f },
+    { -0.9667f,  0.2553f, -0.0182f },
+    { -0.9513f,  0.3069f,  0.0307f },
+    { -0.9843f,  0.1712f, -0.0428f },
+    { -0.9446f,  0.3280f,  0.0121f },
+    { -1.0000f,  0.0000f,  0.0000f },
+    {  0.9436f,  0.3303f,  0.0236f },
+    {  0.9667f,  0.2553f, -0.0182f },
+    {  0.9513f,  0.3069f,  0.0307f },
+    {  0.9843f,  0.1712f, -0.0428f },
+    {  0.9446f,  0.3280f,  0.0121f },
+    {  1.0000f,  0.0000f,  0.0000f },
+    { -1.0000f,  0.0000f,  0.0000f },
+    { -1.0000f,  0.0000f,  0.0000f },
+    { -1.0000f,  0.0000f,  0.0000f },
+    { -1.0000f,  0.0000f,  0.0000f }
+};
+
+const Point3D tree_vertices[13] = {
+    { -0.1200f,  0.0000f, -0.1200f },
+    {  0.1200f,  0.0000f, -0.1200f },
+    {  0.1200f,  0.0000f,  0.1200f },
+    { -0.1200f,  0.0000f,  0.1200f },
+    { -0.1200f,  0.8000f, -0.1200f },
+    {  0.1200f,  0.8000f, -0.1200f },
+    {  0.1200f,  0.8000f,  0.1200f },
+    { -0.1200f,  0.8000f,  0.1200f },
+    { -0.7000f,  0.8000f, -0.7000f },
+    {  0.7000f,  0.8000f, -0.7000f },
+    {  0.7000f,  0.8000f,  0.7000f },
+    { -0.7000f,  0.8000f,  0.7000f },
+    {  0.0000f,  2.8000f,  0.0000f }
+};
+
+const Face tree_faces[9] = {
+    { {  0,  4,  5,  1}, 4, 0, 0x51E0 },
+    { {  1,  5,  6,  2}, 4, 0, 0x51E0 },
+    { {  2,  6,  7,  3}, 4, 0, 0x51E0 },
+    { {  3,  7,  4,  0}, 4, 0, 0x51E0 },
+    { {  8,  9, 10, 11}, 4, 0, 0x04A0 },
+    { {  8, 12,  9,  0}, 3, 0, 0x0640 },
+    { {  9, 12, 10,  0}, 3, 0, 0x0640 },
+    { { 10, 12, 11,  0}, 3, 0, 0x0640 },
+    { { 11, 12,  8,  0}, 3, 0, 0x0640 }
+};
+
+const Point3D tree_normals[9] = {
+    {  0.0000f,  0.0000f, -1.0000f },
+    {  1.0000f,  0.0000f,  0.0000f },
+    {  0.0000f,  0.0000f,  1.0000f },
+    { -1.0000f,  0.0000f,  0.0000f },
+    {  0.0000f, -1.0000f,  0.0000f },
+    {  0.0000f,  0.3304f, -0.9439f },
+    {  0.9439f,  0.3304f, -0.0000f },
+    {  0.0000f,  0.3304f,  0.9439f },
+    { -0.9439f,  0.3304f,  0.0000f }
+};
+
+const Point3D billboard_vertices[8] = {
+    { -1.5000f,  0.0000f,  0.0000f },
+    { -1.5000f,  1.4000f,  0.0000f },
+    {  1.5000f,  0.0000f,  0.0000f },
+    {  1.5000f,  1.4000f,  0.0000f },
+    { -1.8000f,  1.3000f,  0.0000f },
+    {  1.8000f,  1.3000f,  0.0000f },
+    {  1.8000f,  2.4000f,  0.0000f },
+    { -1.8000f,  2.4000f,  0.0000f }
+};
+
+const Face billboard_faces[1] = {
+    { {  4,  5,  6,  7}, 4, 1, 0xFFFF }
+};
+
+const Point3D billboard_normals[1] = {
+    {  0.0000f,  0.0000f,  1.0000f }
+};
+
+const Point3D bridge_vertices[24] = {
+    { -3.4000f,  0.0000f, -0.4000f },
+    { -2.9000f,  0.0000f, -0.4000f },
+    { -2.9000f,  3.5000f, -0.4000f },
+    { -3.4000f,  3.5000f, -0.4000f },
+    { -3.4000f,  0.0000f,  0.4000f },
+    { -2.9000f,  0.0000f,  0.4000f },
+    { -2.9000f,  3.5000f,  0.4000f },
+    { -3.4000f,  3.5000f,  0.4000f },
+    {  2.9000f,  0.0000f, -0.4000f },
+    {  3.4000f,  0.0000f, -0.4000f },
+    {  3.4000f,  3.5000f, -0.4000f },
+    {  2.9000f,  3.5000f, -0.4000f },
+    {  2.9000f,  0.0000f,  0.4000f },
+    {  3.4000f,  0.0000f,  0.4000f },
+    {  3.4000f,  3.5000f,  0.4000f },
+    {  2.9000f,  3.5000f,  0.4000f },
+    { -3.4000f,  3.5000f, -0.4000f },
+    {  3.4000f,  3.5000f, -0.4000f },
+    {  3.4000f,  4.3000f, -0.4000f },
+    { -3.4000f,  4.3000f, -0.4000f },
+    { -3.4000f,  3.5000f,  0.4000f },
+    {  3.4000f,  3.5000f,  0.4000f },
+    {  3.4000f,  4.3000f,  0.4000f },
+    { -3.4000f,  4.3000f,  0.4000f }
+};
+
+const Face bridge_faces[12] = {
+    { {  0,  3,  2,  1}, 4, 1, 0x5AEB },
+    { {  4,  5,  6,  7}, 4, 1, 0x5AEB },
+    { {  0,  4,  7,  3}, 4, 1, 0x3186 },
+    { {  1,  2,  6,  5}, 4, 1, 0x3186 },
+    { {  8, 11, 10,  9}, 4, 1, 0x5AEB },
+    { { 12, 13, 14, 15}, 4, 1, 0x5AEB },
+    { {  8, 12, 15, 11}, 4, 1, 0x3186 },
+    { {  9, 10, 14, 13}, 4, 1, 0x3186 },
+    { { 16, 19, 18, 17}, 4, 1, 0xF800 },
+    { { 20, 21, 22, 23}, 4, 1, 0xF800 },
+    { { 19, 23, 22, 18}, 4, 1, 0xFBE0 },
+    { { 16, 17, 21, 20}, 4, 1, 0x5AEB }
+};
+
+const Face gantry_faces[12] = {
+    { {  0,  3,  2,  1}, 4, 1, 0xFFFF },
+    { {  4,  5,  6,  7}, 4, 1, 0xFFFF },
+    { {  0,  4,  7,  3}, 4, 1, 0x3186 },
+    { {  1,  2,  6,  5}, 4, 1, 0x3186 },
+    { {  8, 11, 10,  9}, 4, 1, 0xFFFF },
+    { { 12, 13, 14, 15}, 4, 1, 0xFFFF },
+    { {  8, 12, 15, 11}, 4, 1, 0x3186 },
+    { {  9, 10, 14, 13}, 4, 1, 0x3186 },
+    { { 16, 19, 18, 17}, 4, 1, 0xFFFF },
+    { { 20, 21, 22, 23}, 4, 1, 0xFFFF },
+    { { 19, 23, 22, 18}, 4, 1, 0x0000 },
+    { { 16, 17, 21, 20}, 4, 1, 0x5AEB }
+};
+
+const Point3D bridge_normals[12] = {
+    {  0.0000f,  0.0000f, -1.0000f },
+    {  0.0000f,  0.0000f,  1.0000f },
+    { -1.0000f,  0.0000f,  0.0000f },
+    {  1.0000f,  0.0000f,  0.0000f },
+    {  0.0000f,  0.0000f, -1.0000f },
+    {  0.0000f,  0.0000f,  1.0000f },
+    { -1.0000f,  0.0000f,  0.0000f },
+    {  1.0000f,  0.0000f,  0.0000f },
+    {  0.0000f,  0.0000f, -1.0000f },
+    {  0.0000f,  0.0000f,  1.0000f },
+    {  0.0000f,  1.0000f,  0.0000f },
+    {  0.0000f, -1.0000f,  0.0000f }
+};
+
+// gantry_faces shares bridge geometry; use bridge_normals with it.
+// ===== END GENERATED MODEL DATA =====
